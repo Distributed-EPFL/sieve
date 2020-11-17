@@ -1,0 +1,21 @@
+[package]
+name = "sieve"
+version = "0.1.0"
+authors = ["Ogier Bouvier <ars3nic@ars3nic.ch>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "system" ] }
+murmur = { git = "https://github.com/Distributed-EPFL/murmur" }
+serde = { version = "1.0" }
+snafu = "0.6"
+tokio = { version = "0.2", features = [ "sync", "rt-util" ] }
+tracing = "0.1"
+
+[dev-dependencies]
+drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "test" ] }
+
+[features]
+test = [ "drop/test", "murmur/test" ]
