@@ -24,8 +24,8 @@ use tracing::{debug, error, warn};
 
 type SharedHandle<M> = Arc<Mutex<Option<MurmurHandle<(M, Signature)>>>>;
 
-/// Type of message exchanged by the
 #[message]
+/// Type of message exchanged by the `Sieve` algorithm
 pub enum SieveMessage<M: Message> {
     #[serde(bound(deserialize = "M: Message"))]
     /// Wraps a message from `Murmur` into a `SieveMessage`
@@ -210,9 +210,8 @@ where
         match message.deref() {
             SieveMessage::Echo(message, signature) => {
                 debug!("echo message from {}", from);
-                let mut signer = self.signer();
 
-                signer
+                self.signer()
                     .verify(signature, &self.sender, message)
                     .map_err(|_| snafu::NoneError)
                     .context(BadSignature { from })?;
@@ -333,16 +332,21 @@ where
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test {
+#[cfg(any(feature = "test", test))]
+pub mod test {
     use super::*;
 
     use drop::test::*;
     use murmur::test::murmur_message_sequence;
 
+    #[cfg(test)]
     const SIZE: usize = 50;
+    #[cfg(test)]
     const MESSAGE: usize = 0;
 
+    /// Generate a test case for delivery of $message using a test network of
+    /// $count peers
+    #[cfg(test)]
     macro_rules! sieve_test {
         ($message:expr, $count:expr) => {
             init_logger();
@@ -373,7 +377,7 @@ pub(crate) mod test {
 
     /// Create a `DummyManager` that will deliver the correct sequence of
     /// messages required for delivery of one sieve message
-    fn create_sieve_manager<T: Message + Clone + 'static>(
+    pub fn create_sieve_manager<T: Message + Clone + 'static>(
         keypair: &KeyPair,
         message: T,
         peer_count: usize,
@@ -392,7 +396,7 @@ pub(crate) mod test {
         (DummyManager::with_key(messages, keys), signature)
     }
 
-    pub(crate) fn sieve_message_sequence<M: Message + 'static>(
+    pub fn sieve_message_sequence<M: Message + 'static>(
         keypair: &KeyPair,
         message: M,
         peer_count: usize,
