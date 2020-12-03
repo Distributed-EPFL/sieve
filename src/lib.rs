@@ -11,7 +11,7 @@ use drop::system::sender::ConvertSender;
 use drop::system::{message, Message, Processor, Sampler, Sender, SenderError};
 use drop::{async_trait, implement_handle};
 
-use murmur::{Murmur, MurmurHandle, MurmurMessage, MurmurProcessingError};
+use murmur::classic::{Murmur, MurmurHandle, MurmurMessage, MurmurProcessingError};
 
 use serde::{Deserialize, Serialize};
 
@@ -337,7 +337,7 @@ pub mod test {
     use super::*;
 
     use drop::test::*;
-    use murmur::test::murmur_message_sequence;
+    use murmur::classic::test::murmur_message_sequence;
 
     #[cfg(test)]
     const SIZE: usize = 50;

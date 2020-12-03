@@ -16,6 +16,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "test" ] }
+murmur = { git = "https://github.com/Distributed-EPFL/murmur", features = [ "test" ] }
 
 [features]
 test = [ "drop/test", "murmur/test" ]
