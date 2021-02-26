@@ -97,6 +97,12 @@ impl EchoHandle {
     }
 }
 
+impl Default for EchoHandle {
+    fn default() -> Self {
+        Self::new(32)
+    }
+}
+
 #[derive(Copy, Clone)]
 enum EchoStatus {
     Conflict(PublicKey),
@@ -138,12 +144,6 @@ impl Ord for EchoStatus {
 impl PartialOrd for EchoStatus {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-impl Default for EchoHandle {
-    fn default() -> Self {
-        Self::new(32)
     }
 }
 
@@ -209,7 +209,7 @@ impl EchoList {
         self.list
             .entry(sequence)
             .and_modify(|x| {
-                x.insert(insert);
+                x.replace(insert);
             })
             .or_insert_with(|| {
                 let mut s = BTreeSet::default();
@@ -223,7 +223,7 @@ impl EchoList {
         self.list
             .entry(sequence)
             .and_modify(|x| {
-                x.insert(EchoStatus::Conflict(pkey));
+                x.replace(EchoStatus::Conflict(pkey));
             })
             .or_insert_with(|| {
                 let mut set = BTreeSet::default();
@@ -336,6 +336,10 @@ impl ConflictAgent {
 mod test {
     use super::*;
 
+    use drop::test::keyset;
+
+    use futures::StreamExt;
+
     use murmur::batched::generate_batch;
 
     static CAP: usize = 32;
@@ -376,7 +380,7 @@ mod test {
         let digest = *batch.info().digest();
         let sequence = 0;
 
-        let keys = drop::test::keyset(SIZE);
+        let keys = keyset(SIZE);
 
         for (count, key) in keys.enumerate() {
             assert_eq!(
@@ -401,6 +405,58 @@ mod test {
                 .check(sender, sequence, digest)
                 .await
                 .expect("agent failure");
+        }
+    }
+
+    #[tokio::test]
+    async fn echo_conflict_sum() {
+        use futures::future;
+
+        let manager = EchoHandle::default();
+        let batch = generate_batch(1);
+
+        let echoes = keyset(SIZE / 2);
+        let conflicts = keyset(SIZE / 2);
+        let digest = *batch.info().digest();
+
+        future::join_all(
+            conflicts
+                .into_iter()
+                .map(|key| manager.conflicts(digest, key, 0)),
+        )
+        .await;
+        let (seq, echo) =
+            future::join_all(echoes.into_iter().map(|key| manager.send(digest, key, 0)))
+                .await
+                .last()
+                .map(Clone::clone)
+                .flatten()
+                .unwrap();
+
+        assert_eq!(seq, 0, "wrong sequence number");
+        assert_eq!(echo, 0, "wrong echo count");
+    }
+
+    #[tokio::test]
+    async fn state_switch() {
+        let manager = EchoHandle::default();
+        let batch = generate_batch(SIZE);
+        let digest = *batch.info().digest();
+        let key = keyset(1).next().unwrap();
+
+        manager
+            .many_conflicts(digest, key, 0..batch.info().sequence())
+            .await;
+
+        let correct: Vec<_> = (0..batch.info().sequence()).take(SIZE / 2).collect();
+
+        let result = manager.send_many(digest, key, correct.clone()).await;
+
+        futures::pin_mut!(result);
+
+        while let Some((seq, count)) = result.next().await {
+            assert!(correct.contains(&seq), "incorrect sequence number");
+            assert_eq!(count, 1, "wrong state switch");
         }
     }
 }
