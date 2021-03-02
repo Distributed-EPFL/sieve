@@ -19,7 +19,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use tracing::debug;
+use tracing::{debug, trace};
 
 mod batch;
 pub use batch::FilteredBatch;
@@ -148,6 +148,7 @@ where
         }
     }
 
+    /// Try registering a possibly new batch and returns a message acknowledging
     async fn register_batch(
         &self,
         batch: Arc<Batch<M>>,
@@ -195,6 +196,7 @@ where
     ) -> impl Stream<Item = Sequence> + 'a {
         let acked = (0..info.sequence()).filter(move |x| !sequences.contains(&x));
         let echoes = self.echoes.send_many(*info.digest(), from, acked).await;
+        let digest = *info.digest();
 
         self.echoes
             .many_conflicts(*info.digest(), from, sequences.iter().copied())
@@ -202,8 +204,16 @@ where
 
         echoes.filter_map(move |(seq, x)| async move {
             if x >= self.threshold as i32 {
+                debug!(
+                    "reached threshold to deliver payload {} of batch {}",
+                    seq, digest
+                );
                 Some(seq)
             } else {
+                debug!(
+                    "only have {}/{} acks to deliver payload {} of batch {}",
+                    x, self.threshold, seq, digest
+                );
                 None
             }
         })
@@ -230,7 +240,8 @@ where
             .collect()
             .await;
 
-        if delivered.is_empty() {
+        if not_delivered.is_empty() {
+            trace!("already delivered all acked sequences for  {}", digest);
             None
         } else {
             self.pending
@@ -399,5 +410,136 @@ where
 
     async fn broadcast(&mut self, message: &M) -> Result<(), Self::Error> {
         todo!("broadcast {:?}", message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIZE: usize = 10;
+
+    use std::iter;
+
+    use drop::test::{keyset, DummyManager};
+
+    use murmur::batched::test::generate_transmit;
+
+    fn message_with_sender<M, I>(
+        keys: impl IntoIterator<Item = PublicKey>,
+        gen: impl Fn() -> I,
+    ) -> impl Iterator<Item = (PublicKey, BatchedSieveMessage<M>)>
+    where
+        M: Message,
+        I: Iterator<Item = BatchedSieveMessage<M>>,
+    {
+        keys.into_iter().zip(gen())
+    }
+
+    #[allow(dead_code)]
+    fn generate_valid_except<M: Message>(
+        info: BatchInfo,
+        count: usize,
+        conflicts: impl IntoIterator<Item = Sequence>,
+    ) -> impl Iterator<Item = BatchedSieveMessage<M>> {
+        let conflicts: Vec<_> = conflicts.into_iter().collect();
+
+        (0..count).map(move |_| BatchedSieveMessage::ValidExcept(info, conflicts.clone()))
+    }
+
+    fn generate_no_conflict<M: Message>(
+        info: BatchInfo,
+        count: usize,
+    ) -> impl Iterator<Item = BatchedSieveMessage<M>> {
+        generate_valid_except(info, count, iter::empty())
+    }
+
+    fn generate_some_conflict<M, I>(
+        info: BatchInfo,
+        count: usize,
+        conflicts: I,
+    ) -> impl Iterator<Item = BatchedSieveMessage<M>>
+    where
+        M: Message,
+        I: Iterator<Item = Sequence> + Clone,
+    {
+        (0..count)
+            .zip(iter::repeat(conflicts))
+            .map(move |(_, conflicts)| BatchedSieveMessage::ValidExcept(info, conflicts.collect()))
+    }
+
+    #[tokio::test]
+    async fn deliver_some_conflict() {
+        drop::test::init_logger();
+
+        const CONFLICT_RANGE: std::ops::Range<Sequence> =
+            (SIZE as Sequence / 2)..(SIZE as Sequence);
+
+        let batch = generate_batch(SIZE);
+        let info = *batch.info();
+        let keys: Vec<_> = keyset(SIZE).collect();
+        let announce = (keys[0], BatchedMurmurMessage::Announce(info, true).into());
+        let murmur = iter::once(announce).chain(
+            keys.clone()
+                .into_iter()
+                .zip(generate_transmit(batch.clone()).map(Into::into)),
+        );
+        let messages = murmur.chain(message_with_sender(keys.clone(), || {
+            generate_some_conflict(info, SIZE, CONFLICT_RANGE)
+        }));
+        let mut manager = DummyManager::with_key(messages, keys);
+        let sieve = BatchedSieve::new(KeyPair::random(), SIZE, Fixed::new_local(), 0);
+
+        let mut handle = manager.run(sieve).await;
+
+        let filtered: FilteredBatch<u32> = handle.deliver().await.expect("no delivery");
+
+        assert_eq!(
+            filtered.excluded_len(),
+            CONFLICT_RANGE.count(),
+            "wrong number of conflicts"
+        );
+        assert_eq!(filtered.len(), SIZE / 2, "wrong number of correct delivery");
+
+        batch
+            .into_iter()
+            .take(CONFLICT_RANGE.count())
+            .zip(filtered.iter())
+            .for_each(|(expected, actual)| {
+                assert_eq!(&expected, actual, "bad payload");
+            });
+    }
+
+    #[tokio::test]
+    async fn deliver_no_conflict() {
+        drop::test::init_logger();
+
+        let batch = generate_batch(SIZE);
+        let info = *batch.info();
+        let keys: Vec<_> = keyset(SIZE).collect();
+
+        let murmur = keys
+            .clone()
+            .into_iter()
+            .zip(generate_transmit(batch.clone()).map(BatchedSieveMessage::Murmur));
+        let sieve = message_with_sender(keys.clone(), || generate_no_conflict(info, SIZE));
+        let announce = (keys[0], BatchedMurmurMessage::Announce(info, true).into());
+        let messages = iter::once(announce).chain(murmur.chain(sieve));
+        let mut manager = DummyManager::with_key(messages, keys.clone());
+
+        let sieve = BatchedSieve::new(KeyPair::random(), SIZE, Fixed::new_local(), 0);
+
+        let mut handle = manager.run(sieve).await;
+
+        let filtered: FilteredBatch<u32> = handle.deliver().await.expect("no delivery");
+
+        assert_eq!(filtered.excluded_len(), 0, "wrong number of conflict");
+
+        batch
+            .into_iter()
+            .zip(filtered.iter())
+            .for_each(|(expected, actual)| {
+                assert_eq!(&expected, actual, "bad payload");
+            });
     }
 }
