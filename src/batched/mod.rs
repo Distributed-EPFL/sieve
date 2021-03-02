@@ -185,10 +185,10 @@ where
         }
     }
 
-    /// Process echoes for a set of `Sequence`s
+    /// Process echoes for a set of excluded `Sequence`s
     /// # Returns
     /// A `Stream` containing the `Sequence`s that have reached the threshold of echoes
-    async fn process_echo<'a>(
+    async fn process_exceptions<'a>(
         &'a self,
         info: &BatchInfo,
         from: PublicKey,
@@ -200,6 +200,10 @@ where
 
         self.echoes
             .many_conflicts(*info.digest(), from, sequences.iter().copied())
+            .await
+            .for_each(|(seq, count)| async move {
+                debug!("{} echoes after conflict signaling for {}", count, seq,);
+            })
             .await;
 
         echoes.filter_map(move |(seq, x)| async move {
@@ -241,7 +245,7 @@ where
             .await;
 
         if not_delivered.is_empty() {
-            trace!("already delivered all acked sequences for  {}", digest);
+            trace!("no new sequences to deliver for {}", digest);
             None
         } else {
             self.pending
@@ -251,9 +255,30 @@ where
                 .map(Clone::clone)
                 .map(|batch| {
                     delivered.extend(&not_delivered);
+                    debug!(
+                        "ready to deliver {} new payloads from {}",
+                        digest,
+                        not_delivered.len(),
+                    );
+
                     FilteredBatch::new(batch, not_delivered)
                 })
         }
+    }
+
+    async fn deliver(&self, batch: FilteredBatch<M>) -> Result<(), BatchedSieveError> {
+        debug!(
+            "delivering {} payloads from batch {}",
+            batch.len(),
+            batch.digest()
+        );
+        self.delivery
+            .as_ref()
+            .context(NotSetup)?
+            .send(batch)
+            .await
+            .map_err(|_| snafu::NoneError)
+            .context(Channel)
     }
 }
 
@@ -282,28 +307,30 @@ where
                     info.digest()
                 );
 
-                let echoes = self.process_echo(info, from, sequences).await;
+                let echoes = self.process_exceptions(info, from, sequences).await;
 
                 if let Some(batch) = self.deliverable(*info.digest(), echoes).await {
-                    debug!(
-                        "ready to deliver {} except {} payloads",
-                        info,
-                        batch.excluded_len()
-                    );
-
-                    self.delivery
-                        .as_ref()
-                        .context(NotSetup)?
-                        .send(batch)
-                        .await
-                        .map_err(|_| snafu::NoneError)
-                        .context(Channel)?;
+                    self.deliver(batch).await?;
                 }
             }
-            BatchedSieveMessage::Ack(ref hash, ref sequence) => {
-                if let Some((seq, echoes)) = self.echoes.send(*hash, from, *sequence).await {
+            BatchedSieveMessage::Ack(ref digest, ref sequence) => {
+                if let Some((seq, echoes)) = self.echoes.send(*digest, from, *sequence).await {
+                    debug!("now have {} p-acks for {} of {}", echoes, seq, digest);
+
                     if echoes >= self.threshold as i32 {
-                        todo!("deliver payload {} if not already delivered", seq);
+                        debug!(
+                            "reached threshold for payload {} of batch {}",
+                            sequence, digest
+                        );
+
+                        if let Some(batch) = self
+                            .deliverable(*digest, stream::once(async move { seq }))
+                            .await
+                        {
+                            debug!("ready to deliver payload {} from {}", sequence, digest);
+
+                            self.deliver(batch).await?;
+                        }
                     }
                 }
             }
@@ -425,18 +452,30 @@ mod tests {
 
     use murmur::batched::test::generate_transmit;
 
-    fn message_with_sender<M, I>(
-        keys: impl IntoIterator<Item = PublicKey>,
-        gen: impl Fn() -> I,
+    fn message_with_sender<M, I, IN>(
+        keys: IN,
+        gen: impl FnOnce() -> I,
     ) -> impl Iterator<Item = (PublicKey, BatchedSieveMessage<M>)>
     where
         M: Message,
         I: Iterator<Item = BatchedSieveMessage<M>>,
+        IN: IntoIterator<Item = PublicKey>,
+        IN::IntoIter: Clone,
     {
-        keys.into_iter().zip(gen())
+        keys.into_iter().cycle().zip(gen())
     }
 
-    #[allow(dead_code)]
+    fn generate_single_ack<M>(
+        info: BatchInfo,
+        count: usize,
+        seq: Sequence,
+    ) -> impl Iterator<Item = BatchedSieveMessage<M>>
+    where
+        M: Message,
+    {
+        (0..count).map(move |_| BatchedSieveMessage::Ack(*info.digest(), seq))
+    }
+
     fn generate_valid_except<M: Message>(
         info: BatchInfo,
         count: usize,
@@ -492,7 +531,7 @@ mod tests {
 
         let mut handle = manager.run(sieve).await;
 
-        let filtered: FilteredBatch<u32> = handle.deliver().await.expect("no delivery");
+        let filtered = handle.deliver().await.expect("no delivery");
 
         assert_eq!(
             filtered.excluded_len(),
@@ -511,6 +550,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliver_single_payload() {
+        drop::test::init_logger();
+
+        const CONFLICT_RANGE: std::ops::Range<Sequence> = CONFLICT..(SIZE as Sequence);
+        const CONFLICT: Sequence = 5;
+
+        let batch = generate_batch(SIZE);
+        let info = *batch.info();
+        let keys: Vec<_> = keyset(SIZE).collect();
+
+        let announce = iter::once(BatchedMurmurMessage::Announce(info, true));
+        let murmur = announce
+            .chain(generate_transmit(batch.clone()))
+            .map(Into::into);
+        let messages = message_with_sender(keys.clone(), move || {
+            murmur
+                .chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE))
+                .chain(generate_single_ack(info, SIZE, CONFLICT))
+        });
+        let sieve = BatchedSieve::new(KeyPair::random(), SIZE, Fixed::new_local(), 0);
+        let mut manager = DummyManager::with_key(messages, keys);
+
+        let mut handle = manager.run(sieve).await;
+
+        let b1 = handle.deliver().await.expect("failed deliver");
+        let b2 = handle.deliver().await.expect("failed deliver");
+
+        assert_eq!(b1.len(), 5);
+        assert_eq!(b2.len(), 1);
+    }
+
+    #[tokio::test]
     async fn deliver_no_conflict() {
         drop::test::init_logger();
 
@@ -521,7 +592,7 @@ mod tests {
         let murmur = keys
             .clone()
             .into_iter()
-            .zip(generate_transmit(batch.clone()).map(BatchedSieveMessage::Murmur));
+            .zip(generate_transmit(batch.clone()).map(Into::into));
         let sieve = message_with_sender(keys.clone(), || generate_no_conflict(info, SIZE));
         let announce = (keys[0], BatchedMurmurMessage::Announce(info, true).into());
         let messages = iter::once(announce).chain(murmur.chain(sieve));
@@ -531,7 +602,7 @@ mod tests {
 
         let mut handle = manager.run(sieve).await;
 
-        let filtered: FilteredBatch<u32> = handle.deliver().await.expect("no delivery");
+        let filtered = handle.deliver().await.expect("no delivery");
 
         assert_eq!(filtered.excluded_len(), 0, "wrong number of conflict");
 

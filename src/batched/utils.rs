@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use drop::crypto::key::exchange::PublicKey;
 use drop::crypto::Digest;
 
-use futures::Stream;
+use futures::stream::{FuturesUnordered, Stream, StreamExt};
 
 use murmur::batched::Sequence;
 
@@ -57,16 +57,23 @@ impl EchoHandle {
         from: PublicKey,
         checks: impl IntoIterator<Item = Sequence> + 'a,
     ) -> impl Stream<Item = (Sequence, i32)> + 'a {
-        stream::iter(checks.into_iter())
-            .then(move |seq| self.send(batch, from, seq))
+        checks
+            .into_iter()
+            .map(|seq| self.send(batch, from, seq))
+            .collect::<FuturesUnordered<_>>()
             .filter_map(|x| async move { x })
     }
 
     /// Register a conflicting block from  a given remote peer
-    pub async fn conflicts(&self, batch: Digest, peer: PublicKey, sequence: Sequence) -> bool {
+    pub async fn conflicts(
+        &self,
+        batch: Digest,
+        peer: PublicKey,
+        sequence: Sequence,
+    ) -> Option<(Sequence, i32)> {
         self.send_command(Command::Conflict(batch, peer, sequence))
             .await
-            .is_some()
+            .map(|count| (sequence, count))
     }
 
     /// Register many conflicts for different sequences for a single peer
@@ -75,14 +82,12 @@ impl EchoHandle {
         batch: Digest,
         peer: PublicKey,
         sequences: impl IntoIterator<Item = Sequence> + 'a,
-    ) -> bool {
-        for sequence in sequences.into_iter() {
-            if !self.conflicts(batch, peer, sequence).await {
-                return false;
-            }
-        }
-
-        true
+    ) -> impl Stream<Item = (Sequence, i32)> + 'a {
+        sequences
+            .into_iter()
+            .map(|seq| self.conflicts(batch, peer, seq))
+            .collect::<FuturesUnordered<_>>()
+            .filter_map(|x| async move { x })
     }
 
     /// Internal helper to send commands to the agent
@@ -99,17 +104,15 @@ impl EchoHandle {
 
 impl Default for EchoHandle {
     fn default() -> Self {
-        Self::new(32)
+        Self::new(128)
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Eq, Copy, Clone, Debug)]
 enum EchoStatus {
     Conflict(PublicKey),
     Okay(PublicKey),
 }
-
-impl Eq for EchoStatus {}
 
 impl PartialEq for EchoStatus {
     fn eq(&self, other: &Self) -> bool {
@@ -170,15 +173,11 @@ impl EchoAgent {
     /// Start the processing loop for this `ConflictManager`
     fn process_loop(mut self) -> JoinHandle<Self> {
         task::spawn(async move {
-            loop {
-                let (command, tx) = match self.receiver.recv().await {
-                    Some((command, tx)) => (command, tx),
-                    None => return self,
-                };
-
+            while let Some((command, tx)) = self.receiver.recv().await {
                 match command {
                     Command::Received(hash, sender, sequence) => {
-                        let conflicts = self.echoes.entry(hash).or_default().echo(sequence, sender);
+                        let entry = self.echoes.entry(hash).or_default();
+                        let conflicts = entry.echo(sequence, sender);
 
                         if tx.send(conflicts).is_err() {
                             error!("agent controller has died");
@@ -186,13 +185,14 @@ impl EchoAgent {
                         }
                     }
                     Command::Conflict(hash, sender, sequence) => {
-                        self.echoes
-                            .entry(hash)
-                            .or_default()
-                            .conflicts(sequence, sender);
+                        let entry = self.echoes.entry(hash).or_default();
+
+                        entry.conflicts(sequence, sender);
                     }
                 }
             }
+
+            self
         })
     }
 }
@@ -223,7 +223,7 @@ impl EchoList {
         self.list
             .entry(sequence)
             .and_modify(|x| {
-                x.replace(EchoStatus::Conflict(pkey));
+                x.insert(EchoStatus::Conflict(pkey));
             })
             .or_insert_with(|| {
                 let mut set = BTreeSet::default();
@@ -294,6 +294,12 @@ impl ConflictHandle {
     }
 }
 
+impl Default for ConflictHandle {
+    fn default() -> Self {
+        Self::new(128)
+    }
+}
+
 struct ConflictAgent {
     commands: mpsc::Receiver<(ConflictCommand, oneshot::Sender<bool>)>,
     registered: HashMap<sign::PublicKey, BTreeMap<Sequence, Digest>>,
@@ -342,7 +348,6 @@ mod test {
 
     use murmur::batched::generate_batch;
 
-    static CAP: usize = 32;
     static SIZE: usize = 100;
 
     #[tokio::test]
@@ -351,7 +356,7 @@ mod test {
 
         drop::test::init_logger();
 
-        let manager = EchoHandle::new(CAP);
+        let manager = EchoHandle::default();
         let batch = generate_batch(SIZE);
         let hash = *batch.info().digest();
         let public = *KeyPair::random().public();
@@ -375,7 +380,7 @@ mod test {
     async fn multiple_acks() {
         drop::test::init_logger();
 
-        let manager = EchoHandle::new(CAP);
+        let manager = EchoHandle::default();
         let batch = generate_batch(1);
         let digest = *batch.info().digest();
         let sequence = 0;
@@ -393,7 +398,7 @@ mod test {
 
     #[tokio::test]
     async fn no_conflict() {
-        let manager = ConflictHandle::new(CAP);
+        let manager = ConflictHandle::default();
         let batch = generate_batch(SIZE);
 
         for payload in batch.iter() {
@@ -405,6 +410,38 @@ mod test {
                 .check(sender, sequence, digest)
                 .await
                 .expect("agent failure");
+        }
+    }
+
+    #[tokio::test]
+    async fn pack_retraction() {
+        let handle = EchoHandle::default();
+        let batch = generate_batch(SIZE / 5);
+        let digest = *batch.info().digest();
+        let keys: Vec<_> = keyset(SIZE).collect();
+
+        for payload in batch.iter() {
+            for key in keys.iter().copied() {
+                handle
+                    .send(digest, key, payload.sequence())
+                    .await
+                    .expect("agent failed");
+                handle.conflicts(digest, key, payload.sequence()).await;
+            }
+        }
+
+        for payload in batch.iter() {
+            for key in keys.iter().copied() {
+                let (_, echoes) = handle
+                    .send(digest, key, payload.sequence())
+                    .await
+                    .expect("oops");
+
+                assert_eq!(
+                    SIZE as i32, echoes,
+                    "replaced a positive ack with a conflict"
+                );
+            }
         }
     }
 
@@ -446,6 +483,8 @@ mod test {
 
         manager
             .many_conflicts(digest, key, 0..batch.info().sequence())
+            .await
+            .collect::<Vec<_>>()
             .await;
 
         let correct: Vec<_> = (0..batch.info().sequence()).take(SIZE / 2).collect();

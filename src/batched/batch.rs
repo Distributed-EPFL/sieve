@@ -32,6 +32,10 @@ where
             included: inclusions.collect().await,
         }
     }
+    /// Get the `Digest` from this `FilteredBatch`
+    pub fn digest(&self) -> &Digest {
+        &self.batch.info().digest()
+    }
 
     /// Check if it is worth delivering this `FilteredBatch`
     pub fn deliverable(&self) -> bool {
@@ -61,6 +65,11 @@ where
     /// Get the total length of this `FilteredBatch` as a `Sequence`
     pub fn sequence(&self) -> Sequence {
         self.batch.info().sequence()
+    }
+
+    /// Merge the given `FilteredBatch` with this one
+    pub fn merge(&mut self, mut other: Self) {
+        self.included.append(&mut other.included);
     }
 
     /// Get an `Iterator` of all valid `Payload`s in this `FilteredBatch`
