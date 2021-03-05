@@ -116,7 +116,7 @@ where
     gossip: RwLock<HashSet<PublicKey>>,
     echoes: EchoHandle,
     conflicts: ConflictHandle,
-    threshold: usize,
+    config: BatchedSieveConfig,
 }
 
 impl<M, S, R> BatchedSieve<M, S, R>
@@ -132,12 +132,12 @@ where
     /// - * threshold: delivery threshold for `Payload`s
     /// - * policy: rendez vous policy to use for batching
     /// - * expected: expected size of local gossip set
-    pub fn new(keypair: KeyPair, threshold: usize, policy: R, _expected: usize) -> Self {
-        let murmur = Arc::new(BatchedMurmur::new(keypair, policy));
+    pub fn new(keypair: KeyPair, policy: R, config: BatchedSieveConfig) -> Self {
+        let murmur = Arc::new(BatchedMurmur::new(keypair, policy, *config.murmur()));
 
         Self {
             murmur,
-            threshold,
+            config,
             pending: Default::default(),
             delivery: Default::default(),
             delivered: Default::default(),
@@ -207,7 +207,7 @@ where
             .await;
 
         echoes.filter_map(move |(seq, x)| async move {
-            if x >= self.threshold as i32 {
+            if self.config.threshold_cmp(x) {
                 debug!(
                     "reached threshold to deliver payload {} of batch {}",
                     seq, digest
@@ -216,7 +216,10 @@ where
             } else {
                 debug!(
                     "only have {}/{} acks to deliver payload {} of batch {}",
-                    x, self.threshold, seq, digest
+                    x,
+                    self.config.threshold(),
+                    seq,
+                    digest
                 );
                 None
             }
@@ -317,7 +320,7 @@ where
                 if let Some((seq, echoes)) = self.echoes.send(*digest, from, *sequence).await {
                     debug!("now have {} p-acks for {} of {}", echoes, seq, digest);
 
-                    if echoes >= self.threshold as i32 {
+                    if self.config.threshold_cmp(echoes) {
                         debug!(
                             "reached threshold for payload {} of batch {}",
                             sequence, digest
@@ -392,6 +395,20 @@ where
         self.delivery.replace(tx);
 
         BatchedSieveHandle::new(rx)
+    }
+}
+
+impl<M, S> Default for BatchedSieve<M, S, Fixed>
+where
+    M: Message + 'static,
+    S: Sender<BatchedSieveMessage<M>>,
+{
+    fn default() -> Self {
+        Self::new(
+            KeyPair::random(),
+            Fixed::new_local(),
+            BatchedSieveConfig::default(),
+        )
     }
 }
 
@@ -527,7 +544,7 @@ mod tests {
             generate_some_conflict(info, SIZE, CONFLICT_RANGE)
         }));
         let mut manager = DummyManager::with_key(messages, keys);
-        let sieve = BatchedSieve::new(KeyPair::random(), SIZE, Fixed::new_local(), 0);
+        let sieve = BatchedSieve::default();
 
         let mut handle = manager.run(sieve).await;
 
@@ -569,7 +586,7 @@ mod tests {
                 .chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE))
                 .chain(generate_single_ack(info, SIZE, CONFLICT))
         });
-        let sieve = BatchedSieve::new(KeyPair::random(), SIZE, Fixed::new_local(), 0);
+        let sieve = BatchedSieve::default();
         let mut manager = DummyManager::with_key(messages, keys);
 
         let mut handle = manager.run(sieve).await;
@@ -598,7 +615,7 @@ mod tests {
         let messages = iter::once(announce).chain(murmur.chain(sieve));
         let mut manager = DummyManager::with_key(messages, keys.clone());
 
-        let sieve = BatchedSieve::new(KeyPair::random(), SIZE, Fixed::new_local(), 0);
+        let sieve = BatchedSieve::default();
 
         let mut handle = manager.run(sieve).await;
 
