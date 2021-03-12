@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::convert;
 use std::sync::Arc;
 
 use drop::async_trait;
@@ -17,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::task;
 
 use tracing::{debug, trace};
 
@@ -79,7 +81,7 @@ pub enum BatchedSieveError {
     /// Underlying `BatchedMumur` error
     Murmur {
         /// Underlying cause
-        source: BatchProcessingError,
+        source: BatchedMurmurError,
     },
     #[snafu(display("sampling error: {}", source))]
     /// A sample couldn't be obtained using the provided `Sampler`
@@ -99,7 +101,7 @@ impl BatchedSieveError {
 
 type MurmurSender<M, S> = ConvertSender<BatchedMurmurMessage<M>, BatchedSieveMessage<M>, S>;
 type MurmurHandle<M, S, R> = BatchedHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>;
-type SharedHandle<H> = Mutex<Option<H>>;
+type SharedHandle<H> = Option<Arc<Mutex<H>>>;
 
 /// A `Batched` version of the `Sieve` algorithm.
 pub struct BatchedSieve<M, S, R>
@@ -158,11 +160,10 @@ where
         match self.pending.write().await.entry(*batch.info().digest()) {
             Entry::Occupied(_) => Ok(None),
             Entry::Vacant(e) => {
-                let mut i = 0;
                 let mut conflicts = Vec::new();
                 let batch = e.insert(batch);
 
-                for block in batch.blocks() {
+                for (i, block) in batch.blocks().enumerate() {
                     for payload in block.iter() {
                         let sender = *payload.sender();
                         let seq = payload.sequence();
@@ -170,9 +171,7 @@ where
                         let digest = hash(&payload).context(HashFail)?;
 
                         if let Some(true) = self.conflicts.check(sender, seq, digest).await {
-                            conflicts.push(i);
-
-                            i += 1;
+                            conflicts.push(i as Sequence);
                         }
                     }
                 }
@@ -289,7 +288,7 @@ where
 impl<M, S, R> Processor<BatchedSieveMessage<M>, M, FilteredBatch<M>, S> for BatchedSieve<M, S, R>
 where
     M: Message + 'static,
-    R: RdvPolicy,
+    R: RdvPolicy + 'static,
     S: Sender<BatchedSieveMessage<M>> + 'static,
 {
     type Error = BatchedSieveError;
@@ -348,10 +347,10 @@ where
 
                 let delivery = self
                     .handle
+                    .as_ref()
+                    .context(NotSetup)?
                     .lock()
                     .await
-                    .as_mut()
-                    .context(NotSetup)?
                     .try_deliver()
                     .await;
 
@@ -376,7 +375,7 @@ where
         SA: Sampler,
     {
         let sample = sampler
-            .sample(sender.keys().await.iter().copied(), 0)
+            .sample(sender.keys().await.iter().copied(), self.config.expected())
             .await
             .expect("unable to collect sample");
 
@@ -388,13 +387,28 @@ where
             .output(sampler, sender)
             .await;
 
-        self.handle.lock().await.replace(handle);
+        let handle = Arc::new(Mutex::new(handle));
+
+        self.handle.replace(handle.clone());
+
+        let (bcast_tx, mut bcast_rx): (
+            _,
+            mpsc::Receiver<(M, oneshot::Sender<Result<(), BatchedMurmurError>>)>,
+        ) = mpsc::channel(32);
+
+        task::spawn(async move {
+            while let Some((message, resp)) = bcast_rx.recv().await {
+                let result = handle.lock().await.broadcast(&message).await;
+
+                let _ = resp.send(result);
+            }
+        });
 
         let (tx, rx) = mpsc::channel(16);
 
         self.delivery.replace(tx);
 
-        BatchedSieveHandle::new(rx)
+        BatchedSieveHandle::new(rx, bcast_tx)
     }
 }
 
@@ -417,7 +431,8 @@ pub struct BatchedSieveHandle<M>
 where
     M: Message,
 {
-    channel: mpsc::Receiver<FilteredBatch<M>>,
+    rx: mpsc::Receiver<FilteredBatch<M>>,
+    tx: mpsc::Sender<(M, oneshot::Sender<Result<(), BatchedMurmurError>>)>,
 }
 
 impl<M> BatchedSieveHandle<M>
@@ -425,8 +440,11 @@ where
     M: Message,
 {
     /// Create a new `Handle`
-    fn new(channel: mpsc::Receiver<FilteredBatch<M>>) -> Self {
-        Self { channel }
+    fn new(
+        rx: mpsc::Receiver<FilteredBatch<M>>,
+        tx: mpsc::Sender<(M, oneshot::Sender<Result<(), BatchedMurmurError>>)>,
+    ) -> Self {
+        Self { rx, tx }
     }
 }
 
@@ -438,7 +456,7 @@ where
     type Error = BatchedSieveError;
 
     async fn deliver(&mut self) -> Result<FilteredBatch<M>, Self::Error> {
-        self.channel.recv().await.ok_or_else(|| Channel.build())
+        self.rx.recv().await.ok_or_else(|| Channel.build())
     }
 
     async fn try_deliver(&mut self) -> Result<Option<FilteredBatch<M>>, Self::Error> {
@@ -453,7 +471,16 @@ where
     }
 
     async fn broadcast(&mut self, message: &M) -> Result<(), Self::Error> {
-        todo!("broadcast {:?}", message)
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send((message.clone(), tx))
+            .await
+            .map_err(|_| Channel.build())?;
+
+        rx.await
+            .map(|ok| ok.context(Murmur))
+            .map_err(|_| Channel.build())
+            .and_then(convert::identity) // this is effectively a Result::flatten
     }
 }
 
@@ -564,6 +591,86 @@ mod tests {
             .for_each(|(expected, actual)| {
                 assert_eq!(&expected, actual, "bad payload");
             });
+    }
+
+    #[tokio::test]
+    async fn broadcast_eventually_announces() {
+        use drop::test::DummyManager;
+
+        let config = BatchedSieveConfig::default();
+        let sieve = BatchedSieve::default();
+        let payloads = 0..config.murmur().sponge_threshold();
+        let keys = keyset(SIZE).collect::<Vec<_>>();
+        let mut manager = DummyManager::with_key(iter::empty(), keys);
+
+        let mut handle = manager.run(sieve).await;
+
+        for x in payloads {
+            handle.broadcast(&x).await.expect("broadcast failed");
+        }
+
+        manager
+            .sender()
+            .messages()
+            .await
+            .into_iter()
+            .for_each(|msg| {
+                if let BatchedSieveMessage::ValidExcept(_, conflicts) = &*msg.1 {
+                    assert!(conflicts.is_empty(), "reported invalid conflcits")
+                }
+            });
+    }
+
+    #[tokio::test]
+    async fn reports_conflicts() {
+        use drop::crypto::sign::Signer;
+        use drop::test::{keyset, DummyManager};
+
+        drop::test::init_logger();
+
+        let config = BatchedSieveConfig {
+            murmur: BatchedMurmurConfig {
+                sponge_threshold: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let sender = *KeyPair::random().public();
+        let keys = keyset(10);
+        let sieve = BatchedSieve::new(KeyPair::random(), Fixed::new_local(), config);
+        let mut signer = Signer::random();
+        let payloads = (0..3).map(|x| {
+            let signature = signer.sign(&x).expect("signing failed");
+            Payload::new(sender, 0, x, signature)
+        });
+
+        let batches: Vec<Batch<usize>> = payloads
+            .map(|payload| iter::once(iter::once(payload).collect()).collect())
+            .collect();
+
+        let messages = batches.iter().cloned().flat_map(|batch| {
+            iter::once(BatchedMurmurMessage::Announce(*batch.info(), true))
+                .chain(generate_transmit(batch))
+                .map(Into::into)
+        });
+
+        let mut manager = DummyManager::with_key(keys.clone().zip(messages), keys);
+
+        manager.run(sieve).await;
+
+        let conflicts = manager
+            .sender()
+            .messages()
+            .await
+            .into_iter()
+            .map(|x| x.1)
+            .fold(0, |acc, curr| match &*curr {
+                BatchedSieveMessage::ValidExcept(_, conflicts) => acc + conflicts.len(),
+                _ => acc,
+            });
+
+        assert_eq!(conflicts, 2, "wrong number of conflicts");
     }
 
     #[tokio::test]
