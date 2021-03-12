@@ -10,15 +10,16 @@ use structopt::StructOpt;
 /// Configuration struct for `BatchedSieve`
 pub struct BatchedSieveConfig {
     #[cfg_attr(feature = "cli", structopt(flatten))]
-    murmur: BatchedMurmurConfig,
+    /// Configuration for the underlying `BatchedMurmur` used
+    pub murmur: BatchedMurmurConfig,
 
     /// Threshold of echoes required to consider some payload valid
     #[cfg_attr(feature = "cli", structopt(long, short))]
-    threshold: usize,
+    pub threshold: usize,
 
     /// Expected size of echo set when sampling
     #[cfg_attr(feature = "cli", structopt(long, short))]
-    expected: usize,
+    pub expected: usize,
 }
 
 impl BatchedSieveConfig {
@@ -48,7 +49,7 @@ impl Default for BatchedSieveConfig {
         Self {
             murmur: BatchedMurmurConfig::default(),
             threshold: 10,
-            expected: 15,
+            expected: 10,
         }
     }
 }
