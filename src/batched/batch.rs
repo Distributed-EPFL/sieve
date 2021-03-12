@@ -72,6 +72,19 @@ where
         self.included.append(&mut other.included);
     }
 
+    /// Create a new `FilteredBatch` that excludes both excluded `Sequence` from this `FilteredBatch` as well as
+    /// the provided `Sequence`s
+    pub fn exclude(&self, range: impl IntoIterator<Item = Sequence>) -> Self {
+        Self {
+            batch: self.batch.clone(),
+            included: self
+                .included
+                .difference(&range.into_iter().collect())
+                .copied()
+                .collect(),
+        }
+    }
+
     /// Get an `Iterator` of all valid `Payload`s in this `FilteredBatch`
     pub fn iter(&self) -> impl Iterator<Item = &Payload<M>> {
         self.batch
