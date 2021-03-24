@@ -325,7 +325,7 @@ impl ConflictAgent {
                             .entry(seq)
                             .or_insert(hash);
 
-                        if resp.send(hash == *conflict).is_err() {
+                        if resp.send(hash != *conflict).is_err() {
                             error!("agent controller crashed during query");
                             return self;
                         }
@@ -411,6 +411,34 @@ mod test {
                 .await
                 .expect("agent failure");
         }
+    }
+
+    #[tokio::test]
+    async fn many_conflicts() {
+        const SEQUENCE: Sequence = 0u32;
+        const SIZE: usize = 10;
+
+        let manager = ConflictHandle::default();
+        let sender = *KeyPair::random().public();
+        let conflicts = (0..SIZE).map(|x| {
+            let digest = hash(&x).expect("hash failed");
+
+            (sender, SEQUENCE, digest)
+        });
+
+        let mut count = 0;
+
+        for (sender, seq, digest) in conflicts {
+            if manager
+                .check(sender, seq, digest)
+                .await
+                .expect("agent failure")
+            {
+                count += 1;
+            }
+        }
+
+        assert_eq!(count, SIZE - 1, "wrong number of conflicts");
     }
 
     #[tokio::test]

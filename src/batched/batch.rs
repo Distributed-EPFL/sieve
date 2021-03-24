@@ -32,6 +32,7 @@ where
             included: inclusions.collect().await,
         }
     }
+
     /// Get the `Digest` from this `FilteredBatch`
     pub fn digest(&self) -> &Digest {
         &self.batch.info().digest()

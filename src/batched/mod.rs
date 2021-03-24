@@ -21,7 +21,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task;
 
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 mod batch;
 pub use batch::FilteredBatch;
@@ -171,10 +171,17 @@ where
                         let digest = hash(&payload).context(HashFail)?;
 
                         if let Some(true) = self.conflicts.check(sender, seq, digest).await {
+                            warn!(
+                                "detected conflict for {:?} in {}",
+                                payload.payload(),
+                                batch.info().digest()
+                            );
                             conflicts.push(i as Sequence);
                         }
                     }
                 }
+
+                debug!("total of {} conflicts in {}", conflicts.len(), batch.info());
 
                 Ok(Some(BatchedSieveMessage::ValidExcept(
                     *batch.info(),
@@ -624,7 +631,9 @@ mod tests {
     #[tokio::test]
     async fn reports_conflicts() {
         use drop::crypto::sign::Signer;
-        use drop::test::{keyset, DummyManager};
+        use drop::test::DummyManager;
+
+        const RANGE: std::ops::Range<usize> = 5..8;
 
         drop::test::init_logger();
 
@@ -636,11 +645,12 @@ mod tests {
             ..Default::default()
         };
 
-        let sender = *KeyPair::random().public();
-        let keys = keyset(10);
         let sieve = BatchedSieve::new(KeyPair::random(), Fixed::new_local(), config);
         let mut signer = Signer::random();
-        let payloads = (0..3).map(|x| {
+        let sender = *signer.public();
+        // send 3 times a different payload with the same sequence number to
+        // provoke some conflict
+        let payloads = RANGE.map(|x| {
             let signature = signer.sign(&x).expect("signing failed");
             Payload::new(sender, 0, x, signature)
         });
@@ -649,13 +659,15 @@ mod tests {
             .map(|payload| iter::once(iter::once(payload).collect()).collect())
             .collect();
 
+        assert_eq!(batches.len(), RANGE.count());
+
         let messages = batches.iter().cloned().flat_map(|batch| {
             iter::once(BatchedMurmurMessage::Announce(*batch.info(), true))
                 .chain(generate_transmit(batch))
                 .map(Into::into)
         });
 
-        let mut manager = DummyManager::with_key(keys.clone().zip(messages), keys);
+        let mut manager = DummyManager::new(messages, 10);
 
         manager.run(sieve).await;
 
@@ -665,12 +677,20 @@ mod tests {
             .await
             .into_iter()
             .map(|x| x.1)
-            .fold(0, |acc, curr| match &*curr {
-                BatchedSieveMessage::ValidExcept(_, conflicts) => acc + conflicts.len(),
+            .fold(HashSet::new(), |mut acc, curr| match &*curr {
+                BatchedSieveMessage::ValidExcept(info, conflicts) => {
+                    acc.extend(iter::repeat(*info.digest()).zip(conflicts.iter().copied()));
+
+                    acc
+                }
                 _ => acc,
             });
 
-        assert_eq!(conflicts, 2, "wrong number of conflicts");
+        assert_eq!(
+            conflicts.len(),
+            RANGE.count() - 1,
+            "wrong number of conflicts"
+        );
     }
 
     #[tokio::test]
