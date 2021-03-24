@@ -204,13 +204,17 @@ where
         let echoes = self.echoes.send_many(*info.digest(), from, acked).await;
         let digest = *info.digest();
 
-        self.echoes
+        let stream = self
+            .echoes
             .many_conflicts(*info.digest(), from, sequences.iter().copied())
             .await
-            .for_each(|(seq, count)| async move {
-                debug!("{} echoes after conflict signaling for {}", count, seq,);
-            })
-            .await;
+            .inspect(|(seq, count)| {
+                debug!("{} echoes after conflict signaling for {}", count, seq,)
+            });
+
+        futures::pin_mut!(stream);
+
+        stream.into_future().await;
 
         echoes.filter_map(move |(seq, x)| async move {
             if self.config.threshold_cmp(x) {
