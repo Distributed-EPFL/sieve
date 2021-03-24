@@ -11,7 +11,7 @@ drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/ref
 murmur = { git = "https://github.com/Distributed-EPFL/murmur", branch = "batched" }
 serde = { version = "1.0" }
 futures = "0.3"
-snafu = "0.6"
+snafu = { version = "0.6", features = [ "backtraces" ] }
 tokio = { version = "1", features = [ "sync" ] }
 tracing = "0.1"
 structopt = { version = "0.3", optional = true }
