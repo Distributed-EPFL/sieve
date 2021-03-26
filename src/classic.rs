@@ -75,9 +75,9 @@ pub enum SieveProcessingError<M: Message> {
     },
 }
 
-impl<M: Message> Into<SieveProcessingError<M>> for DeliveryFailed<M> {
-    fn into(self) -> SieveProcessingError<M> {
-        self.into_error(snafu::NoneError)
+impl<M: Message> From<DeliveryFailed<M>> for SieveProcessingError<M> {
+    fn from(v: DeliveryFailed<M>) -> Self {
+        v.into_error(snafu::NoneError)
     }
 }
 
