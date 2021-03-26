@@ -31,7 +31,8 @@ mod config;
 pub use config::BatchedSieveConfig;
 
 mod utils;
-use utils::{ConflictHandle, EchoHandle};
+use utils::ConflictHandle;
+pub use utils::EchoHandle;
 
 /// Type of messages exchanged by the `BatchedSieveAlgorithm`
 #[message]
