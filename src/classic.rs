@@ -98,7 +98,7 @@ pub struct Sieve<M: Message + 'static> {
     echo_replies: RwLock<HashMap<PublicKey, (M, Signature)>>,
     echo_threshold: usize,
 
-    murmur: Arc<Murmur<(M, Signature)>>,
+    murmur: Murmur<(M, Signature)>,
     handle: SharedHandle<M>,
 }
 
@@ -128,7 +128,7 @@ impl<M: Message> Sieve<M> {
             echo_set: RwLock::new(HashSet::with_capacity(pb_size)),
             echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
 
-            murmur: Arc::new(murmur),
+            murmur,
             handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -148,7 +148,7 @@ impl<M: Message> Sieve<M> {
             echo_set: RwLock::new(HashSet::with_capacity(pb_size)),
             echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
 
-            murmur: Arc::new(murmur),
+            murmur,
             handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -214,7 +214,7 @@ where
     type Error = SieveProcessingError<M>;
 
     async fn process(
-        self: Arc<Self>,
+        &self,
         message: Arc<SieveMessage<M>>,
         from: PublicKey,
         sender: Arc<S>,
@@ -264,7 +264,6 @@ where
                 let murmur_sender = Arc::new(ConvertSender::new(sender.clone()));
 
                 self.murmur
-                    .clone()
                     .process(Arc::new(msg.clone()), from, murmur_sender)
                     .await
                     .context(MurmurProcess)?;
@@ -298,10 +297,7 @@ where
             .expect("sampling failed");
 
         let murmur_sender = Arc::new(ConvertSender::new(sender));
-        let handle = Arc::get_mut(&mut self.murmur)
-            .expect("setup error")
-            .output(sampler.clone(), murmur_sender)
-            .await;
+        let handle = self.murmur.output(sampler.clone(), murmur_sender).await;
 
         debug!("sampling for echo set");
 

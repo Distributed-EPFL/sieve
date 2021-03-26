@@ -309,7 +309,7 @@ where
     type Handle = BatchedSieveHandle<M>;
 
     async fn process(
-        self: Arc<Self>,
+        &self,
         message: Arc<BatchedSieveMessage<M>>,
         from: PublicKey,
         sender: Arc<S>,
