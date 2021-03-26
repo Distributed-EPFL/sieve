@@ -13,6 +13,7 @@ use drop::system::{message, Message, Processor, SampleError, Sampler, Sender, Se
 use futures::{stream, Stream, StreamExt};
 
 use murmur::batched::*;
+pub use murmur::batched::{Fixed, RdvPolicy, RoundRobin};
 
 use serde::{Deserialize, Serialize};
 
