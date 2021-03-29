@@ -497,32 +497,22 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test"))]
+/// Test utilities for [`BatchedSieve`]
+///
+/// [`BatchedSieve`]: self::BatchedSieve
+pub mod test {
     use super::*;
-
-    const SIZE: usize = 10;
 
     use std::iter;
 
-    use drop::test::{keyset, DummyManager};
+    #[cfg(test)]
+    use drop::test::DummyManager;
 
-    use murmur::batched::test::generate_transmit;
+    pub use murmur::batched::test::generate_transmit;
 
-    fn message_with_sender<M, I, IN>(
-        keys: IN,
-        gen: impl FnOnce() -> I,
-    ) -> impl Iterator<Item = (PublicKey, BatchedSieveMessage<M>)>
-    where
-        M: Message,
-        I: Iterator<Item = BatchedSieveMessage<M>>,
-        IN: IntoIterator<Item = PublicKey>,
-        IN::IntoIter: Clone,
-    {
-        keys.into_iter().cycle().zip(gen())
-    }
-
-    fn generate_single_ack<M>(
+    /// Generate a sieve acknowledgment for a single payload in a batch
+    pub fn generate_single_ack<M>(
         info: BatchInfo,
         count: usize,
         seq: Sequence,
@@ -533,7 +523,9 @@ mod tests {
         (0..count).map(move |_| BatchedSieveMessage::Ack(*info.digest(), seq))
     }
 
-    fn generate_valid_except<M: Message>(
+    /// Generate a sequence of `BatchedSieveMessage` that will result in delivery of
+    /// all payloads in the given batch except for the specified conflicts
+    pub fn generate_valid_except<M: Message>(
         info: BatchInfo,
         count: usize,
         conflicts: impl IntoIterator<Item = Sequence>,
@@ -543,14 +535,16 @@ mod tests {
         (0..count).map(move |_| BatchedSieveMessage::ValidExcept(info, conflicts.clone()))
     }
 
-    fn generate_no_conflict<M: Message>(
+    ///  Generate a sequence of message with no conflict reports
+    pub fn generate_no_conflict<M: Message>(
         info: BatchInfo,
         count: usize,
     ) -> impl Iterator<Item = BatchedSieveMessage<M>> {
         generate_valid_except(info, count, iter::empty())
     }
 
-    fn generate_some_conflict<M, I>(
+    /// Generate an `Iterator` of conflicts message for the given batch
+    pub fn generate_some_conflict<M, I>(
         info: BatchInfo,
         count: usize,
         conflicts: I,
@@ -564,26 +558,40 @@ mod tests {
             .map(move |(_, conflicts)| BatchedSieveMessage::ValidExcept(info, conflicts.collect()))
     }
 
+    /// Generate a complete sequence of messages that will result in delivery of a `Batch` from the
+    /// sieve algorithm, excluding the sequences provided in the conflict `Iterator`
+    pub fn generate_sieve_sequence<M, I>(
+        peer_count: usize,
+        batch_size: usize,
+        conflicts: I,
+    ) -> impl Iterator<Item = BatchedSieveMessage<u32>>
+    where
+        M: Message,
+        I: IntoIterator<Item = Sequence>,
+        I::IntoIter: Clone,
+    {
+        let batch = generate_batch(batch_size);
+        let info = *batch.info();
+        let murmur = generate_transmit(batch).map(Into::into);
+        let sieve = generate_some_conflict(info, peer_count, conflicts.into_iter());
+
+        murmur.chain(sieve)
+    }
+
     #[tokio::test]
     async fn deliver_some_conflict() {
         drop::test::init_logger();
 
+        const SIZE: usize = 10;
         const CONFLICT_RANGE: std::ops::Range<Sequence> =
             (SIZE as Sequence / 2)..(SIZE as Sequence);
 
         let batch = generate_batch(SIZE);
         let info = *batch.info();
-        let keys: Vec<_> = keyset(SIZE).collect();
-        let announce = (keys[0], BatchedMurmurMessage::Announce(info, true).into());
-        let murmur = iter::once(announce).chain(
-            keys.clone()
-                .into_iter()
-                .zip(generate_transmit(batch.clone()).map(Into::into)),
-        );
-        let messages = murmur.chain(message_with_sender(keys.clone(), || {
-            generate_some_conflict(info, SIZE, CONFLICT_RANGE)
-        }));
-        let mut manager = DummyManager::with_key(messages, keys);
+        let announce = BatchedMurmurMessage::Announce(info, true).into();
+        let murmur = iter::once(announce).chain(generate_transmit(batch.clone()).map(Into::into));
+        let messages = murmur.chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE));
+        let mut manager = DummyManager::new(messages, SIZE);
         let sieve = BatchedSieve::default();
 
         let mut handle = manager.run(sieve).await;
@@ -610,11 +618,12 @@ mod tests {
     async fn broadcast_eventually_announces() {
         use drop::test::DummyManager;
 
+        const SIZE: usize = 10;
+
         let config = BatchedSieveConfig::default();
         let sieve = BatchedSieve::default();
         let payloads = 0..config.murmur().sponge_threshold();
-        let keys = keyset(SIZE).collect::<Vec<_>>();
-        let mut manager = DummyManager::with_key(iter::empty(), keys);
+        let mut manager = DummyManager::new(iter::empty(), SIZE);
 
         let mut handle = manager.run(sieve).await;
 
@@ -703,25 +712,22 @@ mod tests {
     async fn deliver_single_payload() {
         drop::test::init_logger();
 
+        const SIZE: usize = 10;
         const CONFLICT_RANGE: std::ops::Range<Sequence> = CONFLICT..(SIZE as Sequence);
         const CONFLICT: Sequence = 5;
 
         let batch = generate_batch(SIZE);
         let info = *batch.info();
-        let keys: Vec<_> = keyset(SIZE).collect();
 
         let announce = iter::once(BatchedMurmurMessage::Announce(info, true));
         let murmur = announce
             .chain(generate_transmit(batch.clone()))
             .map(Into::into);
-        let messages = message_with_sender(keys.clone(), move || {
-            murmur
-                .chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE))
-                .chain(generate_single_ack(info, SIZE, CONFLICT))
-        });
+        let messages = murmur
+            .chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE))
+            .chain(generate_single_ack(info, SIZE, CONFLICT));
         let sieve = BatchedSieve::default();
-        let mut manager = DummyManager::with_key(messages, keys);
-
+        let mut manager = DummyManager::new(messages, SIZE);
         let mut handle = manager.run(sieve).await;
 
         let b1 = handle.deliver().await.expect("failed deliver");
@@ -735,18 +741,16 @@ mod tests {
     async fn deliver_no_conflict() {
         drop::test::init_logger();
 
+        const SIZE: usize = 10;
+
         let batch = generate_batch(SIZE);
         let info = *batch.info();
-        let keys: Vec<_> = keyset(SIZE).collect();
 
-        let murmur = keys
-            .clone()
-            .into_iter()
-            .zip(generate_transmit(batch.clone()).map(Into::into));
-        let sieve = message_with_sender(keys.clone(), || generate_no_conflict(info, SIZE));
-        let announce = (keys[0], BatchedMurmurMessage::Announce(info, true).into());
+        let murmur = generate_transmit(batch.clone()).map(Into::into);
+        let sieve = generate_no_conflict(info, SIZE);
+        let announce = BatchedMurmurMessage::Announce(info, true).into();
         let messages = iter::once(announce).chain(murmur.chain(sieve));
-        let mut manager = DummyManager::with_key(messages, keys.clone());
+        let mut manager = DummyManager::new(messages, SIZE);
 
         let sieve = BatchedSieve::default();
 
