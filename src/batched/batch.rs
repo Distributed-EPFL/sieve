@@ -86,6 +86,14 @@ where
         }
     }
 
+    /// Make a new `FilteredBatch` that only contains the specfified set of `Sequence`s
+    pub fn include(&self, range: impl IntoIterator<Item = Sequence>) -> Self {
+        Self {
+            batch: self.batch.clone(),
+            included: range.into_iter().collect(),
+        }
+    }
+
     /// Get an `Iterator` of all valid `Payload`s in this `FilteredBatch`
     pub fn iter(&self) -> impl Iterator<Item = &Payload<M>> {
         self.batch
