@@ -250,7 +250,7 @@ where
         let mut delivered = self.delivered.write().await;
         let delivered = delivered.entry(digest).or_default();
 
-        let not_delivered: Vec<Sequence> = sequences
+        let not_delivered: BTreeSet<Sequence> = sequences
             .filter(|x| {
                 let r = !delivered.contains(x);
 
@@ -276,7 +276,7 @@ where
                         not_delivered.len(),
                     );
 
-                    FilteredBatch::new(batch, not_delivered)
+                    FilteredBatch::with_inclusion(batch, &not_delivered)
                 })
         }
     }
