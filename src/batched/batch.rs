@@ -94,7 +94,22 @@ where
     /// Make a new `FilteredBatch` that only contains the specfified set of `Sequence`s
     /// from this `FilteredBatch`
     pub fn include(&self, range: impl IntoIterator<Item = Sequence>) -> Self {
-        Self::new(self.batch.clone(), range)
+        let new = range.into_iter().collect::<BTreeSet<_>>();
+
+        Self::new(
+            self.batch.clone(),
+            self.excluded.iter().filter(|x| !new.contains(x)).copied(),
+        )
+    }
+
+    /// Make a new `FilteredBatch` that only contains the specified set of `Sequence`
+    pub async fn include_stream(&self, range: impl Stream<Item = Sequence>) -> Self {
+        let included = range.collect::<BTreeSet<_>>().await;
+
+        Self::new(
+            self.batch.clone(),
+            (0..self.batch.info().sequence()).filter(|x| !included.contains(&x)),
+        )
     }
 
     /// Get an `Iterator` of all valid `Payload`s in this `FilteredBatch`
