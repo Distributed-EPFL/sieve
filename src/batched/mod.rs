@@ -133,9 +133,8 @@ where
     ///
     /// # Arguments
     /// - * keypair: local `KeyPair` to use for signing messages
-    /// - * threshold: delivery threshold for `Payload`s
     /// - * policy: rendez vous policy to use for batching
-    /// - * expected: expected size of local gossip set
+    /// - * config: BatchedSieveConfig containing all the other options
     pub fn new(keypair: KeyPair, policy: R, config: BatchedSieveConfig) -> Self {
         let murmur = Arc::new(BatchedMurmur::new(keypair, policy, *config.murmur()));
 
@@ -417,7 +416,7 @@ where
             }
         });
 
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(self.config.murmur.channel_cap());
 
         self.delivery.replace(tx);
 

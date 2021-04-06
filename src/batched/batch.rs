@@ -55,7 +55,7 @@ where
     }
 
     /// Get the list of excluded `Sequence`s in this `FilteredBatch`
-    pub fn included<'a>(&'a self) -> impl Iterator<Item = Sequence> + 'a {
+    pub fn included(&self) -> impl Iterator<Item = Sequence> + '_ {
         (0..self.len() as Sequence).filter(move |x| !self.excluded.contains(&x))
     }
 
