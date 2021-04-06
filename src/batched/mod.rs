@@ -508,7 +508,7 @@ pub mod test {
     #[cfg(test)]
     use drop::test::DummyManager;
 
-    pub use murmur::batched::test::generate_transmit;
+    pub use murmur::batched::test::*;
 
     /// Generate a sieve acknowledgment for a single payload in a batch
     pub fn generate_single_ack<M>(
