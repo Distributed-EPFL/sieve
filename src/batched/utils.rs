@@ -346,7 +346,7 @@ mod test {
 
     use futures::StreamExt;
 
-    use murmur::batched::generate_batch;
+    use murmur::batched::test::generate_batch;
 
     static SIZE: usize = 100;
 
