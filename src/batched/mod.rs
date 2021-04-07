@@ -559,17 +559,15 @@ pub mod test {
 
     /// Generate a complete sequence of messages that will result in delivery of a `Batch` from the
     /// sieve algorithm, excluding the sequences provided in the conflict `Iterator`
-    pub fn generate_sieve_sequence<M, I>(
+    pub fn generate_sieve_sequence<I>(
         peer_count: usize,
-        batch_size: usize,
+        batch: Batch<u32>,
         conflicts: I,
     ) -> impl Iterator<Item = BatchedSieveMessage<u32>>
     where
-        M: Message,
         I: IntoIterator<Item = Sequence>,
         I::IntoIter: Clone,
     {
-        let batch = generate_batch(batch_size);
         let info = *batch.info();
         let murmur = generate_transmit(batch).map(Into::into);
         let sieve = generate_some_conflict(info, peer_count, conflicts.into_iter());
