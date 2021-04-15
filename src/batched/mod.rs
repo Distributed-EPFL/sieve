@@ -12,7 +12,7 @@ use drop::system::{message, Message, Processor, SampleError, Sampler, Sender, Se
 use futures::{stream, Stream, StreamExt};
 
 use murmur::*;
-pub use murmur::{BatchInfo, Fixed, RdvPolicy, RoundRobin, Sequence};
+pub use murmur::{BatchInfo, Fixed, Payload, RdvPolicy, RoundRobin, Sequence};
 
 use postage::dispatch;
 use postage::prelude::{Sink, Stream as _};
