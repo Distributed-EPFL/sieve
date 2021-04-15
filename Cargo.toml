@@ -16,6 +16,7 @@ tokio = { version = "1", features = [ "sync" ] }
 tracing = "0.1"
 structopt = { version = "0.3", optional = true }
 postage = "0.4"
+derive_builder = "0.10"
 
 [dev-dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "test" ] }

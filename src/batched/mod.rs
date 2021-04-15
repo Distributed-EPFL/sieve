@@ -29,7 +29,7 @@ mod batch;
 pub use batch::FilteredBatch;
 
 mod config;
-pub use config::BatchedSieveConfig;
+pub use config::{SieveConfig, SieveConfigBuilder};
 
 mod utils;
 use utils::ConflictHandle;
@@ -37,7 +37,7 @@ pub use utils::EchoHandle;
 
 /// Type of messages exchanged by the `BatchedSieveAlgorithm`
 #[message]
-pub enum BatchedSieveMessage<M>
+pub enum SieveMessage<M>
 where
     M: Message,
 {
@@ -50,7 +50,7 @@ where
     Murmur(MurmurMessage<M>),
 }
 
-impl<M> From<MurmurMessage<M>> for BatchedSieveMessage<M>
+impl<M> From<MurmurMessage<M>> for SieveMessage<M>
 where
     M: Message,
 {
@@ -59,7 +59,7 @@ where
     }
 }
 
-impl<M> From<Payload<M>> for BatchedSieveMessage<M>
+impl<M> From<Payload<M>> for SieveMessage<M>
 where
     M: Message,
 {
@@ -70,7 +70,7 @@ where
 
 /// Type of errors encountered by the `BatchedSieve` algorithm
 #[derive(Debug, Snafu)]
-pub enum BatchedSieveError {
+pub enum SieveError {
     #[snafu(display("network error: {}", source))]
     /// Network error during processing
     Network {
@@ -103,7 +103,7 @@ pub enum BatchedSieveError {
     },
 }
 
-impl BatchedSieveError {
+impl SieveError {
     /// Check whether this `BatchedSieve` instance is able to continue after this error
     /// occured<
     pub fn is_fatal(&self) -> bool {
@@ -111,14 +111,14 @@ impl BatchedSieveError {
     }
 }
 
-type MurmurSender<M, S> = ConvertSender<MurmurMessage<M>, BatchedSieveMessage<M>, S>;
+type MurmurSender<M, S> = ConvertSender<MurmurMessage<M>, SieveMessage<M>, S>;
 type MurmurHandleAlias<M, S, R> = MurmurHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>;
 
 /// A `Batched` version of the `Sieve` algorithm.
-pub struct BatchedSieve<M, S, R>
+pub struct Sieve<M, S, R>
 where
     M: Message + 'static,
-    S: Sender<BatchedSieveMessage<M>>,
+    S: Sender<SieveMessage<M>>,
     R: RdvPolicy,
 {
     pending: RwLock<HashMap<Digest, Arc<Batch<M>>>>,
@@ -129,13 +129,13 @@ where
     gossip: RwLock<HashSet<PublicKey>>,
     echoes: EchoHandle,
     conflicts: ConflictHandle,
-    config: BatchedSieveConfig,
+    config: SieveConfig,
 }
 
-impl<M, S, R> BatchedSieve<M, S, R>
+impl<M, S, R> Sieve<M, S, R>
 where
     M: Message,
-    S: Sender<BatchedSieveMessage<M>>,
+    S: Sender<SieveMessage<M>>,
     R: RdvPolicy,
 {
     /// Create a new `BatchedSieve` instance
@@ -144,7 +144,7 @@ where
     /// - * keypair: local `KeyPair` to use for signing messages
     /// - * policy: rendez vous policy to use for batching
     /// - * config: BatchedSieveConfig containing all the other options
-    pub fn new(keypair: KeyPair, policy: R, config: BatchedSieveConfig) -> Self {
+    pub fn new(keypair: KeyPair, policy: R, config: SieveConfig) -> Self {
         let murmur = Arc::new(Murmur::new(keypair, policy, *config.murmur()));
 
         Self {
@@ -164,7 +164,7 @@ where
     async fn register_batch(
         &self,
         batch: Arc<Batch<M>>,
-    ) -> Result<Option<BatchedSieveMessage<M>>, BatchedSieveError> {
+    ) -> Result<Option<SieveMessage<M>>, SieveError> {
         use std::collections::hash_map::Entry;
 
         match self.pending.write().await.entry(*batch.info().digest()) {
@@ -193,10 +193,7 @@ where
 
                 debug!("total of {} conflicts in {}", conflicts.len(), batch.info());
 
-                Ok(Some(BatchedSieveMessage::ValidExcept(
-                    *batch.info(),
-                    conflicts,
-                )))
+                Ok(Some(SieveMessage::ValidExcept(*batch.info(), conflicts)))
             }
         }
     }
@@ -289,7 +286,7 @@ where
         }
     }
 
-    async fn deliver(&self, batch: FilteredBatch<M>) -> Result<(), BatchedSieveError> {
+    async fn deliver(&self, batch: FilteredBatch<M>) -> Result<(), SieveError> {
         debug!(
             "delivering {} payloads from batch {}",
             batch.len(),
@@ -307,25 +304,24 @@ where
 }
 
 #[async_trait]
-impl<M, S, R> Processor<BatchedSieveMessage<M>, Payload<M>, FilteredBatch<M>, S>
-    for BatchedSieve<M, S, R>
+impl<M, S, R> Processor<SieveMessage<M>, Payload<M>, FilteredBatch<M>, S> for Sieve<M, S, R>
 where
     M: Message + 'static,
     R: RdvPolicy + 'static,
-    S: Sender<BatchedSieveMessage<M>> + 'static,
+    S: Sender<SieveMessage<M>> + 'static,
 {
-    type Error = BatchedSieveError;
+    type Error = SieveError;
 
-    type Handle = BatchedSieveHandle<M, MurmurHandleAlias<M, S, R>>;
+    type Handle = SieveHandle<M, MurmurHandleAlias<M, S, R>>;
 
     async fn process(
         &self,
-        message: Arc<BatchedSieveMessage<M>>,
+        message: Arc<SieveMessage<M>>,
         from: PublicKey,
         sender: Arc<S>,
     ) -> Result<(), Self::Error> {
         match &*message {
-            BatchedSieveMessage::ValidExcept(ref info, ref sequences) => {
+            SieveMessage::ValidExcept(ref info, ref sequences) => {
                 debug!(
                     "acknowledged {} payloads from batch {}",
                     info.size() - sequences.len(),
@@ -338,7 +334,7 @@ where
                     self.deliver(batch).await?;
                 }
             }
-            BatchedSieveMessage::Ack(ref digest, ref sequence) => {
+            SieveMessage::Ack(ref digest, ref sequence) => {
                 if let Some((seq, echoes)) = self.echoes.send(*digest, from, *sequence).await {
                     debug!("now have {} p-acks for {} of {}", echoes, seq, digest);
 
@@ -359,7 +355,7 @@ where
                     }
                 }
             }
-            BatchedSieveMessage::Murmur(murmur) => {
+            SieveMessage::Murmur(murmur) => {
                 let msender = Arc::new(ConvertSender::new(sender.clone()));
 
                 self.murmur
@@ -409,27 +405,27 @@ where
 
         self.delivery.replace(disp_tx);
 
-        BatchedSieveHandle::new(handle, disp_rx)
+        SieveHandle::new(handle, disp_rx)
     }
 }
 
-impl<M, S> Default for BatchedSieve<M, S, Fixed>
+impl<M, S> Default for Sieve<M, S, Fixed>
 where
     M: Message + 'static,
-    S: Sender<BatchedSieveMessage<M>>,
+    S: Sender<SieveMessage<M>>,
 {
     fn default() -> Self {
         Self::new(
             KeyPair::random(),
             Fixed::new_local(),
-            BatchedSieveConfig::default(),
+            SieveConfig::default(),
         )
     }
 }
 
 /// A `Handle` for interacting with the corresponding `BatchedSieve` instance.
 #[derive(Clone)]
-pub struct BatchedSieveHandle<M, H>
+pub struct SieveHandle<M, H>
 where
     M: Message,
     H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
@@ -438,7 +434,7 @@ where
     dispatch: dispatch::Receiver<FilteredBatch<M>>,
 }
 
-impl<M, H> BatchedSieveHandle<M, H>
+impl<M, H> SieveHandle<M, H>
 where
     M: Message,
     H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
@@ -450,12 +446,12 @@ where
 }
 
 #[async_trait]
-impl<M, H> Handle<Payload<M>, FilteredBatch<M>> for BatchedSieveHandle<M, H>
+impl<M, H> Handle<Payload<M>, FilteredBatch<M>> for SieveHandle<M, H>
 where
     M: Message,
     H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
 {
-    type Error = BatchedSieveError;
+    type Error = SieveError;
 
     async fn deliver(&self) -> Result<FilteredBatch<M>, Self::Error> {
         self.dispatch
@@ -499,11 +495,11 @@ pub mod test {
         info: BatchInfo,
         count: usize,
         seq: Sequence,
-    ) -> impl Iterator<Item = BatchedSieveMessage<M>>
+    ) -> impl Iterator<Item = SieveMessage<M>>
     where
         M: Message,
     {
-        (0..count).map(move |_| BatchedSieveMessage::Ack(*info.digest(), seq))
+        (0..count).map(move |_| SieveMessage::Ack(*info.digest(), seq))
     }
 
     /// Generate a sequence of `BatchedSieveMessage` that will result in delivery of
@@ -512,17 +508,17 @@ pub mod test {
         info: BatchInfo,
         count: usize,
         conflicts: impl IntoIterator<Item = Sequence>,
-    ) -> impl Iterator<Item = BatchedSieveMessage<M>> {
+    ) -> impl Iterator<Item = SieveMessage<M>> {
         let conflicts: Vec<_> = conflicts.into_iter().collect();
 
-        (0..count).map(move |_| BatchedSieveMessage::ValidExcept(info, conflicts.clone()))
+        (0..count).map(move |_| SieveMessage::ValidExcept(info, conflicts.clone()))
     }
 
     ///  Generate a sequence of message with no conflict reports
     pub fn generate_no_conflict<M: Message>(
         info: BatchInfo,
         count: usize,
-    ) -> impl Iterator<Item = BatchedSieveMessage<M>> {
+    ) -> impl Iterator<Item = SieveMessage<M>> {
         generate_valid_except(info, count, iter::empty())
     }
 
@@ -531,14 +527,14 @@ pub mod test {
         info: BatchInfo,
         count: usize,
         conflicts: I,
-    ) -> impl Iterator<Item = BatchedSieveMessage<M>>
+    ) -> impl Iterator<Item = SieveMessage<M>>
     where
         M: Message,
         I: Iterator<Item = Sequence> + Clone,
     {
         (0..count)
             .zip(iter::repeat(conflicts))
-            .map(move |(_, conflicts)| BatchedSieveMessage::ValidExcept(info, conflicts.collect()))
+            .map(move |(_, conflicts)| SieveMessage::ValidExcept(info, conflicts.collect()))
     }
 
     /// Generate a complete sequence of messages that will result in delivery of a `Batch` from the
@@ -547,7 +543,7 @@ pub mod test {
         peer_count: usize,
         batch: Batch<u32>,
         conflicts: I,
-    ) -> impl Iterator<Item = BatchedSieveMessage<u32>>
+    ) -> impl Iterator<Item = SieveMessage<u32>>
     where
         I: IntoIterator<Item = Sequence>,
         I::IntoIter: Clone,
@@ -573,7 +569,7 @@ pub mod test {
         let murmur = iter::once(announce).chain(generate_transmit(batch.clone()).map(Into::into));
         let messages = murmur.chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE));
         let mut manager = DummyManager::new(messages, SIZE);
-        let sieve = BatchedSieve::default();
+        let sieve = Sieve::default();
 
         let handle = manager.run(sieve).await;
 
@@ -604,7 +600,7 @@ pub mod test {
 
         drop::test::init_logger();
 
-        let config = BatchedSieveConfig {
+        let config = SieveConfig {
             murmur: MurmurConfig {
                 sponge_threshold: 1,
                 ..Default::default()
@@ -612,7 +608,7 @@ pub mod test {
             ..Default::default()
         };
 
-        let sieve = BatchedSieve::new(KeyPair::random(), Fixed::new_local(), config);
+        let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
         let mut signer = Signer::random();
         let sender = *signer.public();
         // send 3 times a different payload with the same sequence number to
@@ -645,7 +641,7 @@ pub mod test {
             .into_iter()
             .map(|x| x.1)
             .fold(HashSet::new(), |mut acc, curr| match &*curr {
-                BatchedSieveMessage::ValidExcept(info, conflicts) => {
+                SieveMessage::ValidExcept(info, conflicts) => {
                     acc.extend(iter::repeat(*info.digest()).zip(conflicts.iter().copied()));
 
                     acc
@@ -678,7 +674,7 @@ pub mod test {
         let messages = murmur
             .chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE))
             .chain(generate_single_ack(info, SIZE, CONFLICT));
-        let sieve = BatchedSieve::default();
+        let sieve = Sieve::default();
         let mut manager = DummyManager::new(messages, SIZE);
         let handle = manager.run(sieve).await;
 
@@ -704,7 +700,7 @@ pub mod test {
         let messages = iter::once(announce).chain(murmur.chain(sieve));
         let mut manager = DummyManager::new(messages, SIZE);
 
-        let sieve = BatchedSieve::default();
+        let sieve = Sieve::default();
 
         let handle = manager.run(sieve).await;
 

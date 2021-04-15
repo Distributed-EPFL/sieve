@@ -2,13 +2,15 @@ use murmur::MurmurConfig;
 
 use serde::{Deserialize, Serialize};
 
+use derive_builder::Builder;
+
 #[cfg(feature = "cli")]
 use structopt::StructOpt;
 
 #[cfg_attr(feature = "cli", derive(StructOpt))]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Builder)]
 /// Configuration struct for `BatchedSieve`
-pub struct BatchedSieveConfig {
+pub struct SieveConfig {
     #[cfg_attr(feature = "cli", structopt(flatten))]
     /// Configuration for the underlying `BatchedMurmur` used
     pub murmur: MurmurConfig,
@@ -22,7 +24,7 @@ pub struct BatchedSieveConfig {
     pub expected: usize,
 }
 
-impl BatchedSieveConfig {
+impl SieveConfig {
     /// Get the inner murmur configuration
     pub fn murmur(&self) -> &MurmurConfig {
         &self.murmur
@@ -44,7 +46,7 @@ impl BatchedSieveConfig {
     }
 }
 
-impl Default for BatchedSieveConfig {
+impl Default for SieveConfig {
     fn default() -> Self {
         Self {
             murmur: MurmurConfig::default(),
