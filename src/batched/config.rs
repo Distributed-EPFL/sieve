@@ -1,4 +1,4 @@
-use murmur::BatchedMurmurConfig;
+use murmur::MurmurConfig;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,7 @@ use structopt::StructOpt;
 pub struct BatchedSieveConfig {
     #[cfg_attr(feature = "cli", structopt(flatten))]
     /// Configuration for the underlying `BatchedMurmur` used
-    pub murmur: BatchedMurmurConfig,
+    pub murmur: MurmurConfig,
 
     /// Threshold of echoes required to consider some payload valid
     #[cfg_attr(feature = "cli", structopt(long, short))]
@@ -24,7 +24,7 @@ pub struct BatchedSieveConfig {
 
 impl BatchedSieveConfig {
     /// Get the inner murmur configuration
-    pub fn murmur(&self) -> &BatchedMurmurConfig {
+    pub fn murmur(&self) -> &MurmurConfig {
         &self.murmur
     }
 
@@ -47,7 +47,7 @@ impl BatchedSieveConfig {
 impl Default for BatchedSieveConfig {
     fn default() -> Self {
         Self {
-            murmur: BatchedMurmurConfig::default(),
+            murmur: MurmurConfig::default(),
             threshold: 10,
             expected: 10,
         }

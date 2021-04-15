@@ -40,14 +40,9 @@ impl EchoHandle {
         sender: PublicKey,
         seq: Sequence,
     ) -> Option<(Sequence, i32)> {
-        if let Some(echoes) = self
-            .send_command(Command::Received(batch, sender, seq))
+        self.send_command(Command::Received(batch, sender, seq))
             .await
-        {
-            Some((seq, echoes))
-        } else {
-            None
-        }
+            .map(|echoes| (seq, echoes))
     }
 
     /// Register echoes for many different payloads at once

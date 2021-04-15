@@ -47,14 +47,14 @@ where
     ValidExcept(BatchInfo, Vec<Sequence>),
     #[serde(bound(deserialize = "M: Message"))]
     /// Encapsulated `BatchedMurmur` message
-    Murmur(BatchedMurmurMessage<M>),
+    Murmur(MurmurMessage<M>),
 }
 
-impl<M> From<BatchedMurmurMessage<M>> for BatchedSieveMessage<M>
+impl<M> From<MurmurMessage<M>> for BatchedSieveMessage<M>
 where
     M: Message,
 {
-    fn from(msg: BatchedMurmurMessage<M>) -> Self {
+    fn from(msg: MurmurMessage<M>) -> Self {
         Self::Murmur(msg)
     }
 }
@@ -91,9 +91,9 @@ pub enum BatchedSieveError {
     NotSetup,
     #[snafu(display("murmur processing error: {}", source))]
     /// Underlying `BatchedMumur` error
-    Murmur {
+    MurmurFail {
         /// Underlying cause
-        source: BatchedMurmurError,
+        source: MurmurError,
     },
     #[snafu(display("sampling error: {}", source))]
     /// A sample couldn't be obtained using the provided `Sampler`
@@ -111,8 +111,8 @@ impl BatchedSieveError {
     }
 }
 
-type MurmurSender<M, S> = ConvertSender<BatchedMurmurMessage<M>, BatchedSieveMessage<M>, S>;
-type MurmurHandle<M, S, R> = BatchedHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>;
+type MurmurSender<M, S> = ConvertSender<MurmurMessage<M>, BatchedSieveMessage<M>, S>;
+type MurmurHandleAlias<M, S, R> = MurmurHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>;
 
 /// A `Batched` version of the `Sieve` algorithm.
 pub struct BatchedSieve<M, S, R>
@@ -122,8 +122,8 @@ where
     R: RdvPolicy,
 {
     pending: RwLock<HashMap<Digest, Arc<Batch<M>>>>,
-    murmur: Arc<BatchedMurmur<M, R>>,
-    handle: Option<MurmurHandle<M, S, R>>,
+    murmur: Arc<Murmur<M, R>>,
+    handle: Option<MurmurHandleAlias<M, S, R>>,
     delivered: RwLock<HashMap<Digest, BTreeSet<Sequence>>>,
     delivery: Option<dispatch::Sender<FilteredBatch<M>>>,
     gossip: RwLock<HashSet<PublicKey>>,
@@ -145,7 +145,7 @@ where
     /// - * policy: rendez vous policy to use for batching
     /// - * config: BatchedSieveConfig containing all the other options
     pub fn new(keypair: KeyPair, policy: R, config: BatchedSieveConfig) -> Self {
-        let murmur = Arc::new(BatchedMurmur::new(keypair, policy, *config.murmur()));
+        let murmur = Arc::new(Murmur::new(keypair, policy, *config.murmur()));
 
         Self {
             murmur,
@@ -316,7 +316,7 @@ where
 {
     type Error = BatchedSieveError;
 
-    type Handle = BatchedSieveHandle<M, MurmurHandle<M, S, R>>;
+    type Handle = BatchedSieveHandle<M, MurmurHandleAlias<M, S, R>>;
 
     async fn process(
         &self,
@@ -366,7 +366,7 @@ where
                     .clone()
                     .process(Arc::new(murmur.clone()), from, msender)
                     .await
-                    .context(Murmur)?;
+                    .context(MurmurFail)?;
 
                 let delivery = self.handle.as_ref().context(NotSetup)?.try_deliver().await;
 
@@ -405,13 +405,11 @@ where
 
         let (disp_tx, disp_rx) = dispatch::channel(self.config.murmur.channel_cap());
 
-        self.delivery.replace(disp_tx);
-
-        let handle = BatchedSieveHandle::new(handle, disp_rx);
-
         self.handle.replace(handle.clone());
 
-        handle
+        self.delivery.replace(disp_tx);
+
+        BatchedSieveHandle::new(handle, disp_rx)
     }
 }
 
@@ -434,7 +432,7 @@ where
 pub struct BatchedSieveHandle<M, H>
 where
     M: Message,
-    H: Handle<Payload<M>, Arc<Batch<M>>, Error = BatchedMurmurError>,
+    H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
 {
     handle: H,
     dispatch: dispatch::Receiver<FilteredBatch<M>>,
@@ -443,7 +441,7 @@ where
 impl<M, H> BatchedSieveHandle<M, H>
 where
     M: Message,
-    H: Handle<Payload<M>, Arc<Batch<M>>, Error = BatchedMurmurError>,
+    H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
 {
     /// Create a new `Handle` using an underlying `Handle` and dispatch receiver for delivery
     fn new(handle: H, dispatch: dispatch::Receiver<FilteredBatch<M>>) -> Self {
@@ -455,7 +453,7 @@ where
 impl<M, H> Handle<Payload<M>, FilteredBatch<M>> for BatchedSieveHandle<M, H>
 where
     M: Message,
-    H: Handle<Payload<M>, Arc<Batch<M>>, Error = BatchedMurmurError>,
+    H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
 {
     type Error = BatchedSieveError;
 
@@ -478,7 +476,7 @@ where
     }
 
     async fn broadcast(&self, message: &Payload<M>) -> Result<(), Self::Error> {
-        self.handle.broadcast(message).await.context(Murmur)
+        self.handle.broadcast(message).await.context(MurmurFail)
     }
 }
 
@@ -571,13 +569,13 @@ pub mod test {
 
         let batch = generate_batch(SIZE);
         let info = *batch.info();
-        let announce = BatchedMurmurMessage::Announce(info, true).into();
+        let announce = MurmurMessage::Announce(info, true).into();
         let murmur = iter::once(announce).chain(generate_transmit(batch.clone()).map(Into::into));
         let messages = murmur.chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE));
         let mut manager = DummyManager::new(messages, SIZE);
         let sieve = BatchedSieve::default();
 
-        let mut handle = manager.run(sieve).await;
+        let handle = manager.run(sieve).await;
 
         let filtered = handle.deliver().await.expect("no delivery");
 
@@ -598,35 +596,6 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn broadcast_eventually_announces() {
-        use drop::test::DummyManager;
-
-        const SIZE: usize = 10;
-
-        let config = BatchedSieveConfig::default();
-        let sieve = BatchedSieve::default();
-        let payloads = generate_batch(config.murmur().sponge_threshold()).into_iter();
-        let mut manager = DummyManager::new(iter::empty(), SIZE);
-
-        let mut handle = manager.run(sieve).await;
-
-        for x in payloads {
-            handle.broadcast(&x).await.expect("broadcast failed");
-        }
-
-        manager
-            .sender()
-            .messages()
-            .await
-            .into_iter()
-            .for_each(|msg| {
-                if let BatchedSieveMessage::ValidExcept(_, conflicts) = &*msg.1 {
-                    assert!(conflicts.is_empty(), "reported invalid conflcits")
-                }
-            });
-    }
-
-    #[tokio::test]
     async fn reports_conflicts() {
         use drop::crypto::sign::Signer;
         use drop::test::DummyManager;
@@ -636,7 +605,7 @@ pub mod test {
         drop::test::init_logger();
 
         let config = BatchedSieveConfig {
-            murmur: BatchedMurmurConfig {
+            murmur: MurmurConfig {
                 sponge_threshold: 1,
                 ..Default::default()
             },
@@ -660,7 +629,7 @@ pub mod test {
         assert_eq!(batches.len(), RANGE.count());
 
         let messages = batches.iter().cloned().flat_map(|batch| {
-            iter::once(BatchedMurmurMessage::Announce(*batch.info(), true))
+            iter::once(MurmurMessage::Announce(*batch.info(), true))
                 .chain(generate_transmit(batch))
                 .map(Into::into)
         });
@@ -702,7 +671,7 @@ pub mod test {
         let batch = generate_batch(SIZE);
         let info = *batch.info();
 
-        let announce = iter::once(BatchedMurmurMessage::Announce(info, true));
+        let announce = iter::once(MurmurMessage::Announce(info, true));
         let murmur = announce
             .chain(generate_transmit(batch.clone()))
             .map(Into::into);
@@ -711,7 +680,7 @@ pub mod test {
             .chain(generate_single_ack(info, SIZE, CONFLICT));
         let sieve = BatchedSieve::default();
         let mut manager = DummyManager::new(messages, SIZE);
-        let mut handle = manager.run(sieve).await;
+        let handle = manager.run(sieve).await;
 
         let b1 = handle.deliver().await.expect("failed deliver");
         let b2 = handle.deliver().await.expect("failed deliver");
@@ -731,13 +700,13 @@ pub mod test {
 
         let murmur = generate_transmit(batch.clone()).map(Into::into);
         let sieve = generate_no_conflict(info, SIZE);
-        let announce = BatchedMurmurMessage::Announce(info, true).into();
+        let announce = MurmurMessage::Announce(info, true).into();
         let messages = iter::once(announce).chain(murmur.chain(sieve));
         let mut manager = DummyManager::new(messages, SIZE);
 
         let sieve = BatchedSieve::default();
 
-        let mut handle = manager.run(sieve).await;
+        let handle = manager.run(sieve).await;
 
         let filtered = handle.deliver().await.expect("no delivery");
 
