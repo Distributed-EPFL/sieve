@@ -1,4 +1,4 @@
-use murmur::batched::BatchedMurmurConfig;
+use murmur::BatchedMurmurConfig;
 
 use serde::{Deserialize, Serialize};
 

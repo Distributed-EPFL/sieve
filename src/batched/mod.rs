@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::convert;
 use std::sync::Arc;
 
 use drop::async_trait;
@@ -12,15 +11,17 @@ use drop::system::{message, Message, Processor, SampleError, Sampler, Sender, Se
 
 use futures::{stream, Stream, StreamExt};
 
-use murmur::batched::*;
-pub use murmur::batched::{BatchInfo, Fixed, RdvPolicy, RoundRobin, Sequence};
+use murmur::*;
+pub use murmur::{BatchInfo, Fixed, RdvPolicy, RoundRobin, Sequence};
+
+use postage::dispatch;
+use postage::prelude::{Sink, Stream as _};
 
 use serde::{Deserialize, Serialize};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tokio::task;
+use tokio::sync::RwLock;
 
 use tracing::{debug, trace, warn};
 
@@ -55,6 +56,15 @@ where
 {
     fn from(msg: BatchedMurmurMessage<M>) -> Self {
         Self::Murmur(msg)
+    }
+}
+
+impl<M> From<Payload<M>> for BatchedSieveMessage<M>
+where
+    M: Message,
+{
+    fn from(payload: Payload<M>) -> Self {
+        Self::Murmur(payload.into())
     }
 }
 
@@ -103,7 +113,6 @@ impl BatchedSieveError {
 
 type MurmurSender<M, S> = ConvertSender<BatchedMurmurMessage<M>, BatchedSieveMessage<M>, S>;
 type MurmurHandle<M, S, R> = BatchedHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>;
-type SharedHandle<H> = Option<Arc<Mutex<H>>>;
 
 /// A `Batched` version of the `Sieve` algorithm.
 pub struct BatchedSieve<M, S, R>
@@ -114,9 +123,9 @@ where
 {
     pending: RwLock<HashMap<Digest, Arc<Batch<M>>>>,
     murmur: Arc<BatchedMurmur<M, R>>,
-    handle: SharedHandle<MurmurHandle<M, S, R>>,
+    handle: Option<MurmurHandle<M, S, R>>,
     delivered: RwLock<HashMap<Digest, BTreeSet<Sequence>>>,
-    delivery: Option<mpsc::Sender<FilteredBatch<M>>>,
+    delivery: Option<dispatch::Sender<FilteredBatch<M>>>,
     gossip: RwLock<HashSet<PublicKey>>,
     echoes: EchoHandle,
     conflicts: ConflictHandle,
@@ -289,6 +298,7 @@ where
         self.delivery
             .as_ref()
             .context(NotSetup)?
+            .clone()
             .send(batch)
             .await
             .map_err(|_| snafu::NoneError)
@@ -297,7 +307,8 @@ where
 }
 
 #[async_trait]
-impl<M, S, R> Processor<BatchedSieveMessage<M>, M, FilteredBatch<M>, S> for BatchedSieve<M, S, R>
+impl<M, S, R> Processor<BatchedSieveMessage<M>, Payload<M>, FilteredBatch<M>, S>
+    for BatchedSieve<M, S, R>
 where
     M: Message + 'static,
     R: RdvPolicy + 'static,
@@ -305,7 +316,7 @@ where
 {
     type Error = BatchedSieveError;
 
-    type Handle = BatchedSieveHandle<M>;
+    type Handle = BatchedSieveHandle<M, MurmurHandle<M, S, R>>;
 
     async fn process(
         &self,
@@ -357,14 +368,7 @@ where
                     .await
                     .context(Murmur)?;
 
-                let delivery = self
-                    .handle
-                    .as_ref()
-                    .context(NotSetup)?
-                    .lock()
-                    .await
-                    .try_deliver()
-                    .await;
+                let delivery = self.handle.as_ref().context(NotSetup)?.try_deliver().await;
 
                 if let Ok(Some(batch)) = delivery {
                     debug!("delivered a new batch via murmur");
@@ -399,28 +403,15 @@ where
             .output(sampler, sender)
             .await;
 
-        let handle = Arc::new(Mutex::new(handle));
+        let (disp_tx, disp_rx) = dispatch::channel(self.config.murmur.channel_cap());
+
+        self.delivery.replace(disp_tx);
+
+        let handle = BatchedSieveHandle::new(handle, disp_rx);
 
         self.handle.replace(handle.clone());
 
-        let (bcast_tx, mut bcast_rx): (
-            _,
-            mpsc::Receiver<(M, oneshot::Sender<Result<(), BatchedMurmurError>>)>,
-        ) = mpsc::channel(32);
-
-        task::spawn(async move {
-            while let Some((message, resp)) = bcast_rx.recv().await {
-                let result = handle.lock().await.broadcast(&message).await;
-
-                let _ = resp.send(result);
-            }
-        });
-
-        let (tx, rx) = mpsc::channel(self.config.murmur.channel_cap());
-
-        self.delivery.replace(tx);
-
-        BatchedSieveHandle::new(rx, bcast_tx)
+        handle
     }
 }
 
@@ -439,60 +430,55 @@ where
 }
 
 /// A `Handle` for interacting with the corresponding `BatchedSieve` instance.
-pub struct BatchedSieveHandle<M>
+#[derive(Clone)]
+pub struct BatchedSieveHandle<M, H>
 where
     M: Message,
+    H: Handle<Payload<M>, Arc<Batch<M>>, Error = BatchedMurmurError>,
 {
-    rx: mpsc::Receiver<FilteredBatch<M>>,
-    tx: mpsc::Sender<(M, oneshot::Sender<Result<(), BatchedMurmurError>>)>,
+    handle: H,
+    dispatch: dispatch::Receiver<FilteredBatch<M>>,
 }
 
-impl<M> BatchedSieveHandle<M>
+impl<M, H> BatchedSieveHandle<M, H>
 where
     M: Message,
+    H: Handle<Payload<M>, Arc<Batch<M>>, Error = BatchedMurmurError>,
 {
-    /// Create a new `Handle`
-    fn new(
-        rx: mpsc::Receiver<FilteredBatch<M>>,
-        tx: mpsc::Sender<(M, oneshot::Sender<Result<(), BatchedMurmurError>>)>,
-    ) -> Self {
-        Self { rx, tx }
+    /// Create a new `Handle` using an underlying `Handle` and dispatch receiver for delivery
+    fn new(handle: H, dispatch: dispatch::Receiver<FilteredBatch<M>>) -> Self {
+        Self { handle, dispatch }
     }
 }
 
 #[async_trait]
-impl<M> Handle<M, FilteredBatch<M>> for BatchedSieveHandle<M>
+impl<M, H> Handle<Payload<M>, FilteredBatch<M>> for BatchedSieveHandle<M, H>
 where
     M: Message,
+    H: Handle<Payload<M>, Arc<Batch<M>>, Error = BatchedMurmurError>,
 {
     type Error = BatchedSieveError;
 
-    async fn deliver(&mut self) -> Result<FilteredBatch<M>, Self::Error> {
-        self.rx.recv().await.ok_or_else(|| Channel.build())
+    async fn deliver(&self) -> Result<FilteredBatch<M>, Self::Error> {
+        self.dispatch
+            .clone()
+            .recv()
+            .await
+            .ok_or_else(|| Channel.build())
     }
 
-    async fn try_deliver(&mut self) -> Result<Option<FilteredBatch<M>>, Self::Error> {
-        use futures::future::{self, Either};
-        use std::future::ready;
+    async fn try_deliver(&self) -> Result<Option<FilteredBatch<M>>, Self::Error> {
+        use postage::stream::TryRecvError;
 
-        match future::select(self.deliver(), ready(None::<()>)).await {
-            Either::Left((Ok(payload), _)) => Ok(Some(payload)),
-            Either::Left((Err(_), _)) => Channel.fail(),
-            Either::Right(_) => Ok(None),
+        match self.dispatch.clone().try_recv() {
+            Ok(message) => Ok(Some(message)),
+            Err(TryRecvError::Pending) => Ok(None),
+            _ => Channel.fail(),
         }
     }
 
-    async fn broadcast(&mut self, message: &M) -> Result<(), Self::Error> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send((message.clone(), tx))
-            .await
-            .map_err(|_| Channel.build())?;
-
-        rx.await
-            .map(|ok| ok.context(Murmur))
-            .map_err(|_| Channel.build())
-            .and_then(convert::identity) // this is effectively a Result::flatten
+    async fn broadcast(&self, message: &Payload<M>) -> Result<(), Self::Error> {
+        self.handle.broadcast(message).await.context(Murmur)
     }
 }
 
@@ -508,7 +494,7 @@ pub mod test {
     #[cfg(test)]
     use drop::test::DummyManager;
 
-    pub use murmur::batched::test::*;
+    pub use murmur::test::*;
 
     /// Generate a sieve acknowledgment for a single payload in a batch
     pub fn generate_single_ack<M>(
@@ -619,7 +605,7 @@ pub mod test {
 
         let config = BatchedSieveConfig::default();
         let sieve = BatchedSieve::default();
-        let payloads = 0..config.murmur().sponge_threshold();
+        let payloads = generate_batch(config.murmur().sponge_threshold()).into_iter();
         let mut manager = DummyManager::new(iter::empty(), SIZE);
 
         let mut handle = manager.run(sieve).await;

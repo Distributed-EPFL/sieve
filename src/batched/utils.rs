@@ -7,7 +7,7 @@ use drop::crypto::Digest;
 
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
 
-use murmur::batched::Sequence;
+use murmur::Sequence;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{self, JoinHandle};
@@ -346,7 +346,7 @@ mod test {
 
     use futures::StreamExt;
 
-    use murmur::batched::test::generate_batch;
+    use murmur::test::generate_batch;
 
     static SIZE: usize = 100;
 
