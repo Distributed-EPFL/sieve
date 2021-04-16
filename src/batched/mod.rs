@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use tracing::{debug, trace, warn};
 
@@ -123,7 +123,7 @@ where
 {
     pending: RwLock<HashMap<Digest, Arc<Batch<M>>>>,
     murmur: Arc<Murmur<M, R>>,
-    handle: Option<MurmurHandleAlias<M, S, R>>,
+    handle: Option<Mutex<MurmurHandleAlias<M, S, R>>>,
     delivered: RwLock<HashMap<Digest, BTreeSet<Sequence>>>,
     delivery: Option<dispatch::Sender<FilteredBatch<M>>>,
     gossip: RwLock<HashSet<PublicKey>>,
@@ -364,7 +364,14 @@ where
                     .await
                     .context(MurmurFail)?;
 
-                let delivery = self.handle.as_ref().context(NotSetup)?.try_deliver().await;
+                let delivery = self
+                    .handle
+                    .as_ref()
+                    .context(NotSetup)?
+                    .lock()
+                    .await
+                    .try_deliver()
+                    .await;
 
                 if let Ok(Some(batch)) = delivery {
                     debug!("delivered a new batch via murmur");
@@ -401,7 +408,7 @@ where
 
         let (disp_tx, disp_rx) = dispatch::channel(self.config.murmur.channel_cap());
 
-        self.handle.replace(handle.clone());
+        self.handle.replace(Mutex::new(handle.clone()));
 
         self.delivery.replace(disp_tx);
 
@@ -458,25 +465,21 @@ where
 {
     type Error = SieveError;
 
-    async fn deliver(&self) -> Result<FilteredBatch<M>, Self::Error> {
-        self.dispatch
-            .clone()
-            .recv()
-            .await
-            .ok_or_else(|| Channel.build())
+    async fn deliver(&mut self) -> Result<FilteredBatch<M>, Self::Error> {
+        self.dispatch.recv().await.ok_or_else(|| Channel.build())
     }
 
-    async fn try_deliver(&self) -> Result<Option<FilteredBatch<M>>, Self::Error> {
+    async fn try_deliver(&mut self) -> Result<Option<FilteredBatch<M>>, Self::Error> {
         use postage::stream::TryRecvError;
 
-        match self.dispatch.clone().try_recv() {
+        match self.dispatch.try_recv() {
             Ok(message) => Ok(Some(message)),
             Err(TryRecvError::Pending) => Ok(None),
             _ => Channel.fail(),
         }
     }
 
-    async fn broadcast(&self, message: &Payload<M>) -> Result<(), Self::Error> {
+    async fn broadcast(&mut self, message: &Payload<M>) -> Result<(), Self::Error> {
         self.handle.broadcast(message).await.context(MurmurFail)
     }
 }
@@ -590,7 +593,7 @@ pub mod test {
         let mut manager = DummyManager::new(messages, SIZE);
         let sieve = Sieve::default();
 
-        let handle = manager.run(sieve).await;
+        let mut handle = manager.run(sieve).await;
 
         let filtered = handle.deliver().await.expect("no delivery");
 
@@ -695,7 +698,7 @@ pub mod test {
             .chain(generate_single_ack(info, SIZE, CONFLICT));
         let sieve = Sieve::default();
         let mut manager = DummyManager::new(messages, SIZE);
-        let handle = manager.run(sieve).await;
+        let mut handle = manager.run(sieve).await;
 
         let b1 = handle.deliver().await.expect("failed deliver");
         let b2 = handle.deliver().await.expect("failed deliver");
@@ -721,7 +724,7 @@ pub mod test {
 
         let sieve = Sieve::default();
 
-        let handle = manager.run(sieve).await;
+        let mut handle = manager.run(sieve).await;
 
         let filtered = handle.deliver().await.expect("no delivery");
 
