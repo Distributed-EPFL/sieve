@@ -312,7 +312,7 @@ where
 {
     type Error = SieveError;
 
-    type Handle = SieveHandle<M, MurmurHandleAlias<M, S, R>>;
+    type Handle = SieveHandle<M, S, R>;
 
     async fn process(
         &self,
@@ -424,32 +424,37 @@ where
 }
 
 /// A `Handle` for interacting with the corresponding `BatchedSieve` instance.
-#[derive(Clone)]
-pub struct SieveHandle<M, H>
+pub struct SieveHandle<M, S, R>
 where
-    M: Message,
-    H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
 {
-    handle: H,
+    handle: MurmurHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>,
     dispatch: dispatch::Receiver<FilteredBatch<M>>,
 }
 
-impl<M, H> SieveHandle<M, H>
+impl<M, S, R> SieveHandle<M, S, R>
 where
-    M: Message,
-    H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
 {
     /// Create a new `Handle` using an underlying `Handle` and dispatch receiver for delivery
-    fn new(handle: H, dispatch: dispatch::Receiver<FilteredBatch<M>>) -> Self {
+    fn new(
+        handle: MurmurHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>,
+        dispatch: dispatch::Receiver<FilteredBatch<M>>,
+    ) -> Self {
         Self { handle, dispatch }
     }
 }
 
 #[async_trait]
-impl<M, H> Handle<Payload<M>, FilteredBatch<M>> for SieveHandle<M, H>
+impl<M, S, R> Handle<Payload<M>, FilteredBatch<M>> for SieveHandle<M, S, R>
 where
-    M: Message,
-    H: Handle<Payload<M>, Arc<Batch<M>>, Error = MurmurError>,
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
 {
     type Error = SieveError;
 
@@ -473,6 +478,20 @@ where
 
     async fn broadcast(&self, message: &Payload<M>) -> Result<(), Self::Error> {
         self.handle.broadcast(message).await.context(MurmurFail)
+    }
+}
+
+impl<M, S, R> Clone for SieveHandle<M, S, R>
+where
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
+{
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            dispatch: self.dispatch.clone(),
+        }
     }
 }
 
