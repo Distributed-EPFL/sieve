@@ -394,7 +394,10 @@ where
         SA: Sampler,
     {
         let sample = sampler
-            .sample(sender.keys().await.iter().copied(), self.config.expected())
+            .sample(
+                sender.keys().await.iter().copied(),
+                self.config.sample_size(),
+            )
             .await
             .expect("unable to collect sample");
 
