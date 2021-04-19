@@ -25,24 +25,9 @@ pub struct SieveConfig {
 }
 
 impl SieveConfig {
-    /// Get the inner murmur configuration
-    pub fn murmur(&self) -> &MurmurConfig {
-        &self.murmur
-    }
-
-    /// Get the echo threshold
-    pub fn threshold(&self) -> usize {
-        self.echo_threshold
-    }
-
     /// Check if the  given argument is greater or equal to the threshold
     pub fn threshold_cmp(&self, have: i32) -> bool {
         have >= self.echo_threshold as i32
-    }
-
-    /// Get expected size of echo set of peers
-    pub fn sample_size(&self) -> usize {
-        self.sieve_sample_size
     }
 }
 

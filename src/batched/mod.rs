@@ -145,7 +145,7 @@ where
     /// - * policy: rendez vous policy to use for batching
     /// - * config: BatchedSieveConfig containing all the other options
     pub fn new(keypair: KeyPair, policy: R, config: SieveConfig) -> Self {
-        let murmur = Arc::new(Murmur::new(keypair, policy, *config.murmur()));
+        let murmur = Arc::new(Murmur::new(keypair, policy, config.murmur));
 
         Self {
             murmur,
@@ -233,10 +233,7 @@ where
             } else {
                 debug!(
                     "only have {}/{} acks to deliver payload {} of batch {}",
-                    x,
-                    self.config.threshold(),
-                    seq,
-                    digest
+                    x, self.config.echo_threshold, seq, digest
                 );
                 None
             }
@@ -396,7 +393,7 @@ where
         let sample = sampler
             .sample(
                 sender.keys().await.iter().copied(),
-                self.config.sample_size(),
+                self.config.sieve_sample_size,
             )
             .await
             .expect("unable to collect sample");
@@ -409,7 +406,7 @@ where
             .output(sampler, sender)
             .await;
 
-        let (disp_tx, disp_rx) = dispatch::channel(self.config.murmur.channel_cap());
+        let (disp_tx, disp_rx) = dispatch::channel(self.config.murmur.channel_cap);
 
         self.handle.replace(Mutex::new(handle.clone()));
 
