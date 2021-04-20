@@ -35,7 +35,9 @@ mod utils;
 use utils::ConflictHandle;
 pub use utils::EchoHandle;
 
-/// Type of messages exchanged by the `BatchedSieveAlgorithm`
+/// Type of messages exchanged by the [`Sieve`] algorithm
+///
+/// [`Sieve`]: self::Sieve
 #[message]
 pub enum SieveMessage<M>
 where
@@ -46,7 +48,9 @@ where
     /// Acknowledge all payloads in a batch with a list of exceptions
     ValidExcept(BatchInfo, Vec<Sequence>),
     #[serde(bound(deserialize = "M: Message"))]
-    /// Encapsulated `BatchedMurmur` message
+    /// Encapsulated [`Murmur`] message
+    ///
+    /// [`Murmur`]: murmur::Murmur
     Murmur(MurmurMessage<M>),
 }
 
@@ -68,7 +72,9 @@ where
     }
 }
 
-/// Type of errors encountered by the `BatchedSieve` algorithm
+/// Type of errors encountered by the [`Sieve`] algorithm
+///
+/// [`Sieve`]: self::Sieve
 #[derive(Debug, Snafu)]
 pub enum SieveError {
     #[snafu(display("network error: {}", source))]
@@ -90,13 +96,15 @@ pub enum SieveError {
     /// Processor was not setup correctly before running
     NotSetup,
     #[snafu(display("murmur processing error: {}", source))]
-    /// Underlying `BatchedMumur` error
+    /// Underlying [`Murmur`] error
+    ///
+    /// [`Murmur`]: murmur::Murmur
     MurmurFail {
         /// Underlying cause
         source: MurmurError,
     },
     #[snafu(display("sampling error: {}", source))]
-    /// A sample couldn't be obtained using the provided `Sampler`
+    /// A sample couldn't be obtained using the provided Sampler
     Sampling {
         /// Actual error cause
         source: SampleError,
@@ -104,8 +112,10 @@ pub enum SieveError {
 }
 
 impl SieveError {
-    /// Check whether this `BatchedSieve` instance is able to continue after this error
+    /// Check whether this [`Sieve`] instance is able to continue after this error
     /// occured
+    ///
+    /// [`Sieve`]: self::Sieve
     pub fn is_fatal(&self) -> bool {
         matches!(self, Self::Channel | Self::NotSetup)
     }
@@ -114,7 +124,7 @@ impl SieveError {
 type MurmurSender<M, S> = ConvertSender<MurmurMessage<M>, SieveMessage<M>, S>;
 type MurmurHandleAlias<M, S, R> = MurmurHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>;
 
-/// A `Batched` version of the `Sieve` algorithm.
+/// A batch version of the `Sieve` algorithm.
 pub struct Sieve<M, S, R>
 where
     M: Message + 'static,
@@ -138,12 +148,15 @@ where
     S: Sender<SieveMessage<M>>,
     R: RdvPolicy,
 {
-    /// Create a new `BatchedSieve` instance
+    /// Create a new [`Sieve`] instance
     ///
     /// # Arguments
     /// - * keypair: local `KeyPair` to use for signing messages
     /// - * policy: rendez vous policy to use for batching
-    /// - * config: BatchedSieveConfig containing all the other options
+    /// - * config: [`SieveConfig`] containing all the other options
+    ///
+    /// [`Sieve`]: self::Sieve
+    /// [`SieveConfig`]: self::SieveConfig
     pub fn new(keypair: KeyPair, policy: R, config: SieveConfig) -> Self {
         let murmur = Arc::new(Murmur::new(keypair, policy, config.murmur));
 
@@ -426,7 +439,10 @@ where
     }
 }
 
-/// A `Handle` for interacting with the corresponding `BatchedSieve` instance.
+/// A [`Handle`] for interacting with the corresponding [`Sieve`] instance.
+///
+/// [`Handle`]: drop::system::manager::Handle
+/// [`Sieve`]: self::Sieve
 pub struct SieveHandle<M, S, R>
 where
     M: Message + 'static,
@@ -495,9 +511,9 @@ where
 }
 
 #[cfg(any(test, feature = "test"))]
-/// Test utilities for [`BatchedSieve`]
+/// Test utilities for [`Sieve`]
 ///
-/// [`BatchedSieve`]: self::BatchedSieve
+/// [`Sieve`]: self::Sieve
 pub mod test {
     use super::*;
 
@@ -520,7 +536,7 @@ pub mod test {
         (0..count).map(move |_| SieveMessage::Ack(*info.digest(), seq))
     }
 
-    /// Generate a sequence of `BatchedSieveMessage` that will result in delivery of
+    /// Generate a sequence of `SieveMessage` that will result in delivery of
     /// all payloads in the given batch except for the specified conflicts
     pub fn generate_valid_except<M: Message>(
         info: BatchInfo,

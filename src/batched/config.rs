@@ -9,10 +9,14 @@ use structopt::StructOpt;
 
 #[cfg_attr(feature = "cli", derive(StructOpt))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Builder)]
-/// Configuration struct for `BatchedSieve`
+/// Configuration struct for [`Sieve`]
+///
+/// [`Sieve`]: super::Sieve
 pub struct SieveConfig {
     #[cfg_attr(feature = "cli", structopt(flatten))]
-    /// Configuration for the underlying `BatchedMurmur` used
+    /// Configuration for the underlying [`Murmur`] used
+    ///
+    /// [`Murmur`]: murmur::Murmur
     pub murmur: MurmurConfig,
 
     /// Threshold of echoes required to consider some payload valid
