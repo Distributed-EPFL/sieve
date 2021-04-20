@@ -54,6 +54,11 @@ where
         self.len() == 0
     }
 
+    /// Get an `Iterator` of sequences excluded from this `FilteredBatch`
+    pub fn excluded(&self) -> impl Iterator<Item = Sequence> + '_ {
+        self.excluded.iter().copied()
+    }
+
     /// Get the list of excluded `Sequence`s in this `FilteredBatch`
     pub fn included(&self) -> impl Iterator<Item = Sequence> + '_ {
         (0..self.len() as Sequence).filter(move |x| !self.excluded.contains(&x))
