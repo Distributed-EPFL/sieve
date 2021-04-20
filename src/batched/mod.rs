@@ -105,7 +105,7 @@ pub enum SieveError {
 
 impl SieveError {
     /// Check whether this `BatchedSieve` instance is able to continue after this error
-    /// occured<
+    /// occured
     pub fn is_fatal(&self) -> bool {
         matches!(self, Self::Channel | Self::NotSetup)
     }
