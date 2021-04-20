@@ -104,6 +104,8 @@ impl Default for EchoHandle {
 }
 
 #[derive(Eq, Copy, Clone, Debug)]
+/// This implements both PartialEq and Ord manually since we don't want
+/// and Okay(x) being replaced in the set by a Conflict(x)
 enum EchoStatus {
     Conflict(PublicKey),
     Okay(PublicKey),
