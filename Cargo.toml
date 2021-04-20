@@ -10,13 +10,20 @@ edition = "2018"
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "system" ] }
 murmur = { git = "https://github.com/Distributed-EPFL/murmur" }
 serde = { version = "1.0" }
-snafu = "0.6"
-tokio = { version = "0.2", features = [ "sync", "rt-util" ] }
+futures = "0.3"
+snafu = { version = "0.6", features = [ "backtraces" ] }
+tokio = { version = "1", features = [ "sync" ] }
 tracing = "0.1"
+structopt = { version = "0.3", optional = true }
+postage = "0.4"
+derive_builder = "0.10"
 
 [dev-dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", branch = "feature/refactor", features = [ "test" ] }
 murmur = { git = "https://github.com/Distributed-EPFL/murmur", features = [ "test" ] }
 
 [features]
+default = []
+cli = [ "structopt", "murmur/cli" ]
 test = [ "drop/test", "murmur/test" ]
+

@@ -1,470 +1,759 @@
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
-use std::ops::Deref;
+#![deny(missing_docs)]
+
+//! This crate provides an implementation of the [`Sieve`] consistent broadcast algorithm. <br />
+//! See the examples directory for examples on how to use this in your application
+//!
+//! [`Sieve`]: self::Sieve
+
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use drop::async_trait;
+use drop::crypto::hash::{hash, Digest, HashError};
 use drop::crypto::key::exchange::PublicKey;
-use drop::crypto::sign::{self, KeyPair, Signature, Signer};
+use drop::crypto::sign::{self, KeyPair};
 use drop::system::manager::Handle;
 use drop::system::sender::ConvertSender;
-use drop::system::{message, Message, Processor, Sampler, Sender, SenderError};
-use drop::{async_trait, implement_handle};
+use drop::system::{message, Message, Processor, SampleError, Sampler, Sender, SenderError};
 
-use murmur::classic::{Murmur, MurmurHandle, MurmurMessage, MurmurProcessingError};
+use futures::{stream, Stream, StreamExt};
+
+use murmur::*;
+pub use murmur::{BatchInfo, Fixed, Payload, RdvPolicy, RoundRobin, Sequence};
+
+use postage::dispatch;
+use postage::prelude::{Sink, Stream as _};
 
 use serde::{Deserialize, Serialize};
 
-use snafu::{IntoError, OptionExt, ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 
-use tokio::sync::{oneshot, Mutex, RwLock};
-use tokio::task;
+use tokio::sync::{Mutex, RwLock};
 
-use tracing::{debug, error, warn};
+use tracing::{debug, trace, warn};
 
-type SharedHandle<M> = Arc<Mutex<Option<MurmurHandle<(M, Signature)>>>>;
+mod batch;
+pub use batch::FilteredBatch;
 
+mod config;
+pub use config::{SieveConfig, SieveConfigBuilder};
+
+mod utils;
+use utils::ConflictHandle;
+pub use utils::EchoHandle;
+
+/// Type of messages exchanged by the [`Sieve`] algorithm
+///
+/// [`Sieve`]: self::Sieve
 #[message]
-/// Type of message exchanged by the `Sieve` algorithm
-pub enum SieveMessage<M: Message> {
+pub enum SieveMessage<M>
+where
+    M: Message,
+{
+    /// Acknowledge a single payload from a given batch
+    Ack(Digest, Sequence),
+    /// Acknowledge all payloads in a batch with a list of exceptions
+    ValidExcept(BatchInfo, Vec<Sequence>),
     #[serde(bound(deserialize = "M: Message"))]
-    /// Wraps a message from `Murmur` into a `SieveMessage`
-    Probabilistic(MurmurMessage<(M, Signature)>),
-    #[serde(bound(deserialize = "M: Message"))]
-    /// Message used during echo rounds
-    Echo(M, Signature),
-    /// Subscribe to the `Echo` set of a remote peer
-    EchoSubscribe,
+    /// Encapsulated [`Murmur`] message
+    ///
+    /// [`Murmur`]: murmur::Murmur
+    Murmur(MurmurMessage<M>),
 }
 
-impl<M: Message> From<MurmurMessage<(M, Signature)>> for SieveMessage<M> {
-    fn from(v: MurmurMessage<(M, Signature)>) -> Self {
-        SieveMessage::Probabilistic(v)
+impl<M> From<MurmurMessage<M>> for SieveMessage<M>
+where
+    M: Message,
+{
+    fn from(msg: MurmurMessage<M>) -> Self {
+        Self::Murmur(msg)
     }
 }
 
+impl<M> From<Payload<M>> for SieveMessage<M>
+where
+    M: Message,
+{
+    fn from(payload: Payload<M>) -> Self {
+        Self::Murmur(payload.into())
+    }
+}
+
+/// Type of errors encountered by the [`Sieve`] algorithm
+///
+/// [`Sieve`]: self::Sieve
 #[derive(Debug, Snafu)]
-/// Error by `Sieve::process` when processing a message
-pub enum SieveProcessingError<M: Message> {
+pub enum SieveError {
     #[snafu(display("network error: {}", source))]
-    /// A network error occured
-    Network { source: SenderError },
-
-    #[snafu(display("bad signature from {}", from))]
-    /// The processed message had a wrong signature
-    BadSignature { from: PublicKey },
-
-    #[snafu(display("delivery failed"))]
-    /// The message contained in this error could not be delivered
-    DeliveryFailed { message: M },
-
-    #[snafu(display("murmur error: {}", source))]
-    /// Murmur encountered an error processing a message
-    MurmurProcess { source: MurmurProcessingError },
+    /// Network error during processing
+    Network {
+        /// Network error cause
+        source: SenderError,
+    },
+    #[snafu(display("channel closed"))]
+    /// A channel was closed too early
+    Channel,
+    #[snafu(display("unable to hash message: {}", source))]
+    /// Failure to hash something
+    HashFail {
+        /// Underlying cause
+        source: HashError,
+    },
+    #[snafu(display("processor was not setup"))]
+    /// Processor was not setup correctly before running
+    NotSetup,
+    #[snafu(display("murmur processing error: {}", source))]
+    /// Underlying [`Murmur`] error
+    ///
+    /// [`Murmur`]: murmur::Murmur
+    MurmurFail {
+        /// Underlying cause
+        source: MurmurError,
+    },
+    #[snafu(display("sampling error: {}", source))]
+    /// A sample couldn't be obtained using the provided Sampler
+    Sampling {
+        /// Actual error cause
+        source: SampleError,
+    },
 }
 
-impl<M: Message> Into<SieveProcessingError<M>> for DeliveryFailed<M> {
-    fn into(self) -> SieveProcessingError<M> {
-        self.into_error(snafu::NoneError)
+impl SieveError {
+    /// Check whether this [`Sieve`] instance is able to continue after this error
+    /// occured
+    ///
+    /// [`Sieve`]: self::Sieve
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::Channel | Self::NotSetup)
     }
 }
 
-implement_handle!(SieveHandle, SieveError, SieveMessage);
+type MurmurSender<M, S> = ConvertSender<MurmurMessage<M>, SieveMessage<M>, S>;
+type MurmurHandleAlias<M, S, R> = MurmurHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>;
 
-/// An implementation of the `Sieve` probabilistic consistent broadcast
-/// algorithm. `Sieve` is a single-shot shot broadcast algorithm using
-/// a designated sender for each instance.
-pub struct Sieve<M: Message + 'static> {
-    deliverer: Mutex<Option<oneshot::Sender<M>>>,
-    sender: sign::PublicKey,
-    keypair: Arc<KeyPair>,
-
-    expected: usize,
-
-    echo: Mutex<Option<(M, Signature)>>,
-    echo_set: RwLock<HashSet<PublicKey>>,
-    echo_replies: RwLock<HashMap<PublicKey, (M, Signature)>>,
-    echo_threshold: usize,
-
-    murmur: Arc<Murmur<(M, Signature)>>,
-    handle: SharedHandle<M>,
+/// A batch version of the `Sieve` algorithm.
+pub struct Sieve<M, S, R>
+where
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
+{
+    pending: RwLock<HashMap<Digest, Arc<Batch<M>>>>,
+    murmur: Arc<Murmur<M, R>>,
+    handle: Option<Mutex<MurmurHandleAlias<M, S, R>>>,
+    delivered: RwLock<HashMap<Digest, BTreeSet<Sequence>>>,
+    delivery: Option<dispatch::Sender<FilteredBatch<M>>>,
+    gossip: RwLock<HashSet<PublicKey>>,
+    echoes: EchoHandle,
+    conflicts: ConflictHandle,
+    config: SieveConfig,
 }
 
-impl<M: Message> Sieve<M> {
-    /// Create a new double echo receiver for the given sender.
-    /// * Arguments
-    /// `sender` designated sender's public key for this instance
-    /// `keypair` local keypair used  for signing
-    /// `echo_threshold` number of echo messages to wait for before delivery
-    /// `pb_size` expected sample size
-    pub fn new_receiver(
-        sender: sign::PublicKey,
-        keypair: Arc<KeyPair>,
-        echo_threshold: usize,
-        pb_size: usize,
-    ) -> Self {
-        let murmur = Murmur::new_receiver(sender, keypair.clone(), pb_size);
+impl<M, S, R> Sieve<M, S, R>
+where
+    M: Message,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
+{
+    /// Create a new [`Sieve`] instance
+    ///
+    /// # Arguments
+    /// - * keypair: local `KeyPair` to use for signing messages
+    /// - * policy: rendez vous policy to use for batching
+    /// - * config: [`SieveConfig`] containing all the other options
+    ///
+    /// [`Sieve`]: self::Sieve
+    /// [`SieveConfig`]: self::SieveConfig
+    pub fn new(keypair: KeyPair, policy: R, config: SieveConfig) -> Self {
+        let murmur = Arc::new(Murmur::new(keypair, policy, config.murmur));
 
         Self {
-            sender,
-            deliverer: Mutex::new(None),
-            keypair,
-            expected: pb_size,
-
-            echo: Mutex::new(None),
-            echo_threshold,
-            echo_set: RwLock::new(HashSet::with_capacity(pb_size)),
-            echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
-
-            murmur: Arc::new(murmur),
-            handle: Arc::new(Mutex::new(None)),
+            murmur,
+            config,
+            pending: Default::default(),
+            delivery: Default::default(),
+            delivered: Default::default(),
+            handle: Default::default(),
+            gossip: Default::default(),
+            echoes: EchoHandle::new(32),
+            conflicts: ConflictHandle::new(32),
         }
     }
 
-    /// Create a new `Sieve` receiver.
-    pub fn new_sender(keypair: Arc<KeyPair>, echo_threshold: usize, pb_size: usize) -> Self {
-        let murmur = Murmur::new_sender(keypair.clone(), pb_size);
+    /// Try registering a possibly new batch and returns a message acknowledging
+    async fn register_batch(
+        &self,
+        batch: Arc<Batch<M>>,
+    ) -> Result<Option<SieveMessage<M>>, SieveError> {
+        use std::collections::hash_map::Entry;
 
-        Self {
-            sender: *keypair.public(),
-            keypair,
-            deliverer: Mutex::new(None),
-            expected: pb_size,
+        match self.pending.write().await.entry(*batch.info().digest()) {
+            Entry::Occupied(_) => Ok(None),
+            Entry::Vacant(e) => {
+                let mut conflicts = Vec::new();
+                let batch = e.insert(batch);
 
-            echo: Mutex::new(None),
-            echo_threshold,
-            echo_set: RwLock::new(HashSet::with_capacity(pb_size)),
-            echo_replies: RwLock::new(HashMap::with_capacity(echo_threshold)),
+                for (i, block) in batch.blocks().enumerate() {
+                    for payload in block.iter() {
+                        let sender = *payload.sender();
+                        let seq = payload.sequence();
 
-            murmur: Arc::new(murmur),
-            handle: Arc::new(Mutex::new(None)),
+                        let digest = hash(&payload).context(HashFail)?;
+
+                        if let Some(true) = self.conflicts.check(sender, seq, digest).await {
+                            warn!(
+                                "detected conflict for {:?} in {}",
+                                payload.payload(),
+                                batch.info().digest()
+                            );
+                            conflicts.push(i as Sequence);
+                        }
+                    }
+                }
+
+                debug!("total of {} conflicts in {}", conflicts.len(), batch.info());
+
+                Ok(Some(SieveMessage::ValidExcept(*batch.info(), conflicts)))
+            }
         }
     }
 
-    async fn check_echo_set(&self, signature: &Signature, message: &M) -> bool {
-        let count = self
-            .echo_replies
-            .read()
+    /// Process echoes for a set of excluded `Sequence`s
+    /// # Returns
+    /// A `Stream` containing the `Sequence`s that have reached the threshold of echoes
+    async fn process_exceptions<'a>(
+        &'a self,
+        info: &BatchInfo,
+        from: PublicKey,
+        sequences: &'a [Sequence],
+    ) -> impl Stream<Item = Sequence> + 'a {
+        let acked = (0..info.sequence()).filter(move |x| !sequences.contains(&x));
+        let echoes = self.echoes.send_many(*info.digest(), from, acked).await;
+        let digest = *info.digest();
+
+        self.echoes
+            .many_conflicts(*info.digest(), from, sequences.iter().copied())
             .await
-            .values()
-            .filter(|(stored_message, stored_signature)| {
-                stored_message == message && stored_signature == signature
+            .for_each(|(seq, count)| async move {
+                debug!("{} echoes after conflict signaling for {}", count, seq,)
             })
-            .count();
+            .await;
 
-        if count >= self.echo_threshold {
-            debug!("reached delivery threshold, checking correctness");
-
-            if let Some((recv_msg, recv_signature)) = &*self.echo.lock().await {
-                if recv_msg == message && recv_signature == signature {
-                    true
-                } else {
-                    warn!("mismatched message received");
-                    false
-                }
+        echoes.filter_map(move |(seq, x)| async move {
+            if self.config.threshold_cmp(x) {
+                debug!(
+                    "reached threshold to deliver payload {} of batch {}",
+                    seq, digest
+                );
+                Some(seq)
             } else {
-                false
+                debug!(
+                    "only have {}/{} acks to deliver payload {} of batch {}",
+                    x, self.config.echo_threshold, seq, digest
+                );
+                None
             }
+        })
+    }
+
+    /// Check a `Stream`  of sequences to see which ones have already been delivered
+    /// # Returns
+    /// `Some` if at least one `Sequence` in the `Stream` has not been delivered yet,
+    /// `None` otherwise
+    async fn deliverable(
+        &self,
+        digest: Digest,
+        sequences: impl Stream<Item = Sequence>,
+    ) -> Option<FilteredBatch<M>> {
+        let mut delivered = self.delivered.write().await;
+        let delivered = delivered.entry(digest).or_default();
+
+        let not_delivered: BTreeSet<Sequence> = sequences
+            .filter(|x| {
+                let r = !delivered.contains(x);
+
+                async move { r }
+            })
+            .collect()
+            .await;
+
+        if not_delivered.is_empty() {
+            trace!("no new sequences to deliver for {}", digest);
+            None
         } else {
-            debug!("still waiting for {} messages", self.echo_threshold - count);
-            false
+            self.pending
+                .read()
+                .await
+                .get(&digest)
+                .map(Clone::clone)
+                .map(|batch| {
+                    delivered.extend(&not_delivered);
+                    debug!(
+                        "ready to deliver {} new payloads from {}",
+                        digest,
+                        not_delivered.len(),
+                    );
+
+                    FilteredBatch::with_inclusion(batch, &not_delivered)
+                })
         }
     }
 
-    async fn update_echo_set(&self, from: PublicKey, signature: &Signature, message: &M) -> bool {
-        if self.echo_set.read().await.contains(&from) {
-            match self.echo_replies.write().await.entry(from) {
-                Entry::Occupied(_) => false,
-                Entry::Vacant(e) => {
-                    debug!("registered correct echo message from {}", from);
-                    e.insert((message.clone(), *signature));
-                    true
-                }
-            }
-        } else {
-            false
-        }
-    }
-
-    fn signer(&self) -> Signer {
-        Signer::new(self.keypair.deref().clone())
+    async fn deliver(&self, batch: FilteredBatch<M>) -> Result<(), SieveError> {
+        debug!(
+            "delivering {} payloads from batch {}",
+            batch.len(),
+            batch.digest()
+        );
+        self.delivery
+            .as_ref()
+            .context(NotSetup)?
+            .clone()
+            .send(batch)
+            .await
+            .map_err(|_| snafu::NoneError)
+            .context(Channel)
     }
 }
 
 #[async_trait]
-impl<M, S> Processor<SieveMessage<M>, M, S> for Sieve<M>
+impl<M, S, R> Processor<SieveMessage<M>, Payload<M>, FilteredBatch<M>, S> for Sieve<M, S, R>
 where
-    S: Sender<SieveMessage<M>> + 'static,
     M: Message + 'static,
+    R: RdvPolicy + 'static,
+    S: Sender<SieveMessage<M>> + 'static,
 {
-    type Handle = SieveHandle<M>;
+    type Error = SieveError;
 
-    type Error = SieveProcessingError<M>;
+    type Handle = SieveHandle<M, S, R>;
 
     async fn process(
-        self: Arc<Self>,
+        &self,
         message: Arc<SieveMessage<M>>,
         from: PublicKey,
         sender: Arc<S>,
     ) -> Result<(), Self::Error> {
-        match message.deref() {
-            SieveMessage::Echo(message, signature) => {
-                debug!("echo message from {}", from);
+        match &*message {
+            SieveMessage::ValidExcept(ref info, ref sequences) => {
+                debug!(
+                    "acknowledged {} payloads from batch {}",
+                    info.size() - sequences.len(),
+                    info.digest()
+                );
 
-                self.signer()
-                    .verify(signature, &self.sender, message)
-                    .map_err(|_| snafu::NoneError)
-                    .context(BadSignature { from })?;
+                let echoes = self.process_exceptions(info, from, sequences).await;
 
-                if self.update_echo_set(from, signature, message).await
-                    && self.check_echo_set(signature, message).await
-                {
-                    if let Some(sender) = self.deliverer.lock().await.take() {
-                        return sender
-                            .send(message.clone())
-                            .map_err(|message| DeliveryFailed { message }.into());
-                    } else {
-                        debug!("already delivered a message");
+                if let Some(batch) = self.deliverable(*info.digest(), echoes).await {
+                    self.deliver(batch).await?;
+                }
+            }
+            SieveMessage::Ack(ref digest, ref sequence) => {
+                if let Some((seq, echoes)) = self.echoes.send(*digest, from, *sequence).await {
+                    debug!("now have {} p-acks for {} of {}", echoes, seq, digest);
+
+                    if self.config.threshold_cmp(echoes) {
+                        debug!(
+                            "reached threshold for payload {} of batch {}",
+                            sequence, digest
+                        );
+
+                        if let Some(batch) = self
+                            .deliverable(*digest, stream::once(async move { seq }))
+                            .await
+                        {
+                            debug!("ready to deliver payload {} from {}", sequence, digest);
+
+                            self.deliver(batch).await?;
+                        }
                     }
                 }
-
-                Ok(())
             }
-            SieveMessage::EchoSubscribe => {
-                if self.echo_set.write().await.insert(from) {
-                    if let Some((message, signature)) = self.echo.lock().await.deref() {
-                        debug!("echo subscription from {}", from);
-                        let message = SieveMessage::Echo(message.clone(), *signature);
+            SieveMessage::Murmur(murmur) => {
+                let msender = Arc::new(ConvertSender::new(sender.clone()));
 
+                self.murmur
+                    .clone()
+                    .process(Arc::new(murmur.clone()), from, msender)
+                    .await
+                    .context(MurmurFail)?;
+
+                let delivery = self
+                    .handle
+                    .as_ref()
+                    .context(NotSetup)?
+                    .lock()
+                    .await
+                    .try_deliver()
+                    .await;
+
+                if let Ok(Some(batch)) = delivery {
+                    debug!("delivered a new batch via murmur");
+
+                    if let Some(ack) = self.register_batch(batch).await? {
                         sender
-                            .send(Arc::new(message), &from)
+                            .send_many(Arc::new(ack), self.gossip.read().await.iter())
                             .await
                             .context(Network)?;
                     }
                 }
-
-                Ok(())
-            }
-
-            SieveMessage::Probabilistic(msg) => {
-                debug!("processing murmur message {:?}", msg);
-
-                let murmur_sender = Arc::new(ConvertSender::new(sender.clone()));
-
-                self.murmur
-                    .clone()
-                    .process(Arc::new(msg.clone()), from, murmur_sender)
-                    .await
-                    .context(MurmurProcess)?;
-
-                let mut guard = self.handle.lock().await;
-
-                if let Some(mut handle) = guard.take() {
-                    if let Ok(Some((message, signature))) = handle.try_deliver() {
-                        debug!("delivered {:?} using murmur", message);
-                        *self.echo.lock().await = Some((message, signature));
-                    } else {
-                        guard.replace(handle);
-                    }
-                } else {
-                    debug!("late message for probabilistic broadcast");
-                }
-
-                Ok(())
             }
         }
+
+        Ok(())
     }
 
-    async fn output<SA: Sampler>(&mut self, sampler: Arc<SA>, sender: Arc<S>) -> Self::Handle {
-        let (outgoing_tx, outgoing_rx) = oneshot::channel();
-        let (incoming_tx, incoming_rx) = oneshot::channel();
-        let subscribe_sender = sender.clone();
-
+    async fn output<SA>(&mut self, sampler: Arc<SA>, sender: Arc<S>) -> Self::Handle
+    where
+        SA: Sampler,
+    {
         let sample = sampler
-            .sample(sender.keys().await.iter().copied(), self.expected)
-            .await
-            .expect("sampling failed");
-
-        let murmur_sender = Arc::new(ConvertSender::new(sender));
-        let handle = Arc::get_mut(&mut self.murmur)
-            .expect("setup error")
-            .output(sampler.clone(), murmur_sender)
-            .await;
-
-        debug!("sampling for echo set");
-
-        self.echo_set.write().await.extend(sample);
-
-        if let Err(e) = subscribe_sender
-            .send_many(
-                Arc::new(SieveMessage::EchoSubscribe),
-                self.echo_set.read().await.iter(),
+            .sample(
+                sender.keys().await.iter().copied(),
+                self.config.sieve_sample_size,
             )
             .await
-        {
-            error!("could not send subscriptions: {}", e);
-        }
+            .expect("unable to collect sample");
 
-        self.handle.lock().await.replace(handle);
-        self.deliverer.lock().await.replace(incoming_tx);
+        self.gossip.write().await.extend(sample);
 
-        let outgoing_tx = if self.sender == *self.keypair.public() {
-            let handle = self.handle.clone();
+        let sender = Arc::new(ConvertSender::new(sender));
+        let handle = Arc::get_mut(&mut self.murmur)
+            .expect("setup should be run first")
+            .output(sampler, sender)
+            .await;
 
-            task::spawn(async move {
-                if let Ok(msg) = outgoing_rx.await {
-                    if let Some(handle) = handle.lock().await.as_mut() {
-                        if let Err(e) = handle.broadcast(&msg).await {
-                            error!("unable to broadcast message using murmur: {}", e);
-                        }
-                    }
-                } else {
-                    error!("broadcast sender not used");
-                }
-            });
+        let (disp_tx, disp_rx) = dispatch::channel(self.config.murmur.channel_cap);
 
-            Some(outgoing_tx)
-        } else {
-            None
-        };
+        self.handle.replace(Mutex::new(handle.clone()));
 
-        SieveHandle::new(self.keypair.clone(), incoming_rx, outgoing_tx)
+        self.delivery.replace(disp_tx);
+
+        SieveHandle::new(handle, disp_rx)
     }
 }
 
-#[cfg(any(feature = "test", test))]
+impl<M, S> Default for Sieve<M, S, Fixed>
+where
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+{
+    fn default() -> Self {
+        Self::new(
+            KeyPair::random(),
+            Fixed::new_local(),
+            SieveConfig::default(),
+        )
+    }
+}
+
+/// A [`Handle`] for interacting with the corresponding [`Sieve`] instance.
+///
+/// [`Handle`]: drop::system::manager::Handle
+/// [`Sieve`]: self::Sieve
+pub struct SieveHandle<M, S, R>
+where
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
+{
+    handle: MurmurHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>,
+    dispatch: dispatch::Receiver<FilteredBatch<M>>,
+}
+
+impl<M, S, R> SieveHandle<M, S, R>
+where
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
+{
+    /// Create a new `Handle` using an underlying `Handle` and dispatch receiver for delivery
+    fn new(
+        handle: MurmurHandle<M, Arc<Batch<M>>, MurmurSender<M, S>, R>,
+        dispatch: dispatch::Receiver<FilteredBatch<M>>,
+    ) -> Self {
+        Self { handle, dispatch }
+    }
+}
+
+#[async_trait]
+impl<M, S, R> Handle<Payload<M>, FilteredBatch<M>> for SieveHandle<M, S, R>
+where
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
+{
+    type Error = SieveError;
+
+    async fn deliver(&mut self) -> Result<FilteredBatch<M>, Self::Error> {
+        self.dispatch.recv().await.ok_or_else(|| Channel.build())
+    }
+
+    async fn try_deliver(&mut self) -> Result<Option<FilteredBatch<M>>, Self::Error> {
+        use postage::stream::TryRecvError;
+
+        match self.dispatch.try_recv() {
+            Ok(message) => Ok(Some(message)),
+            Err(TryRecvError::Pending) => Ok(None),
+            _ => Channel.fail(),
+        }
+    }
+
+    async fn broadcast(&mut self, message: &Payload<M>) -> Result<(), Self::Error> {
+        self.handle.broadcast(message).await.context(MurmurFail)
+    }
+}
+
+impl<M, S, R> Clone for SieveHandle<M, S, R>
+where
+    M: Message + 'static,
+    S: Sender<SieveMessage<M>>,
+    R: RdvPolicy,
+{
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            dispatch: self.dispatch.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test"))]
+/// Test utilities for [`Sieve`]
+///
+/// [`Sieve`]: self::Sieve
 pub mod test {
     use super::*;
 
-    use drop::test::*;
-    use murmur::classic::test::murmur_message_sequence;
+    use std::iter;
 
     #[cfg(test)]
-    const SIZE: usize = 50;
-    #[cfg(test)]
-    const MESSAGE: usize = 0;
+    use drop::test::DummyManager;
 
-    /// Generate a test case for delivery of $message using a test network of
-    /// $count peers
-    #[cfg(test)]
-    macro_rules! sieve_test {
-        ($message:expr, $count:expr) => {
-            init_logger();
+    pub use murmur::test::*;
 
-            let keypair = Arc::new(KeyPair::random());
-            let message = $message;
-            let sender = Arc::new(KeyPair::random());
-            let (manager, signature) = create_sieve_manager(&sender, message.clone(), $count);
-
-            let processor =
-                Sieve::new_receiver(sender.public().clone(), keypair.clone(), SIZE / 5, SIZE / 3);
-
-            let mut handle = manager.run(processor).await;
-
-            let received = handle.deliver().await.expect("deliver failed");
-
-            let mut signer = Signer::new(keypair.deref().clone());
-
-            assert_eq!(message, received, "wrong message delivered");
-            assert!(
-                signer
-                    .verify(&signature, sender.public(), &received)
-                    .is_ok(),
-                "bad signature"
-            );
-        };
+    /// Generate a sieve acknowledgment for a single payload in a batch
+    pub fn generate_single_ack<M>(
+        info: BatchInfo,
+        count: usize,
+        seq: Sequence,
+    ) -> impl Iterator<Item = SieveMessage<M>>
+    where
+        M: Message,
+    {
+        (0..count).map(move |_| SieveMessage::Ack(*info.digest(), seq))
     }
 
-    /// Create a `DummyManager` that will deliver the correct sequence of
-    /// messages required for delivery of one sieve message
-    pub fn create_sieve_manager<T: Message + Clone + 'static>(
-        keypair: &KeyPair,
-        message: T,
-        peer_count: usize,
-    ) -> (DummyManager<SieveMessage<T>, T>, Signature) {
-        let mut signer = Signer::new(keypair.clone());
-        let signature = signer.sign(&message).expect("sign failed");
-        let echos = sieve_message_sequence(keypair, message, peer_count).collect::<Vec<_>>();
-        let keys = keyset(peer_count).collect::<Vec<_>>();
-        let messages = keys
-            .iter()
-            .chain(keys.iter())
-            .cloned()
-            .zip(echos)
-            .collect::<Vec<_>>();
-
-        (DummyManager::with_key(messages, keys), signature)
-    }
-
-    pub fn sieve_message_sequence<M: Message + 'static>(
-        keypair: &KeyPair,
-        message: M,
-        peer_count: usize,
+    /// Generate a sequence of `SieveMessage` that will result in delivery of
+    /// all payloads in the given batch except for the specified conflicts
+    pub fn generate_valid_except<M: Message>(
+        info: BatchInfo,
+        count: usize,
+        conflicts: impl IntoIterator<Item = Sequence>,
     ) -> impl Iterator<Item = SieveMessage<M>> {
-        let signature = Signer::new(keypair.clone())
-            .sign(&message)
-            .expect("sign failed");
+        let conflicts: Vec<_> = conflicts.into_iter().collect();
 
-        let gossip = murmur_message_sequence((message.clone(), signature), keypair, peer_count)
-            .map(SieveMessage::Probabilistic);
-
-        gossip.chain((0..peer_count).map(move |_| SieveMessage::Echo(message.clone(), signature)))
+        (0..count).map(move |_| SieveMessage::ValidExcept(info, conflicts.clone()))
     }
 
-    #[test]
-    fn sequence_generation() {
-        let keypair = KeyPair::random();
-        let message = 0usize;
-        let count = 25;
-        let messages = sieve_message_sequence(&keypair, message, count);
+    ///  Generate a sequence of message with no conflict reports
+    pub fn generate_no_conflict<M: Message>(
+        info: BatchInfo,
+        count: usize,
+    ) -> impl Iterator<Item = SieveMessage<M>> {
+        generate_valid_except(info, count, iter::empty())
+    }
 
-        assert_eq!(messages.count(), count * 2);
+    /// Generate an `Iterator` of conflicts message for the given batch
+    pub fn generate_some_conflict<M, I>(
+        info: BatchInfo,
+        count: usize,
+        conflicts: I,
+    ) -> impl Iterator<Item = SieveMessage<M>>
+    where
+        M: Message,
+        I: Iterator<Item = Sequence> + Clone,
+    {
+        (0..count)
+            .zip(iter::repeat(conflicts))
+            .map(move |(_, conflicts)| SieveMessage::ValidExcept(info, conflicts.collect()))
+    }
+
+    /// Generate a complete sequence of messages that will result in delivery of a `Batch` from the
+    /// sieve algorithm, excluding the sequences provided in the conflict `Iterator`
+    pub fn generate_sieve_sequence<I>(
+        peer_count: usize,
+        batch: Batch<u32>,
+        conflicts: I,
+    ) -> impl Iterator<Item = SieveMessage<u32>>
+    where
+        I: IntoIterator<Item = Sequence>,
+        I::IntoIter: Clone,
+    {
+        let info = *batch.info();
+        let murmur = generate_transmit(batch).map(Into::into);
+        let sieve = generate_some_conflict(info, peer_count, conflicts.into_iter());
+
+        murmur.chain(sieve)
     }
 
     #[tokio::test]
-    async fn deliver_vec_no_network() {
-        let msg = vec![0u64, 1, 2, 3, 4, 5, 6, 7];
+    async fn deliver_some_conflict() {
+        drop::test::init_logger();
 
-        sieve_test!(msg, SIZE);
+        const SIZE: usize = 10;
+        const CONFLICT_RANGE: std::ops::Range<Sequence> =
+            (SIZE as Sequence / 2)..(SIZE as Sequence);
+
+        let batch = generate_batch(SIZE);
+        let info = *batch.info();
+        let announce = MurmurMessage::Announce(info, true).into();
+        let murmur = iter::once(announce).chain(generate_transmit(batch.clone()).map(Into::into));
+        let messages = murmur.chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE));
+        let mut manager = DummyManager::new(messages, SIZE);
+        let sieve = Sieve::default();
+
+        let mut handle = manager.run(sieve).await;
+
+        let filtered = handle.deliver().await.expect("no delivery");
+
+        assert_eq!(
+            filtered.excluded_len(),
+            CONFLICT_RANGE.count(),
+            "wrong number of conflicts"
+        );
+        assert_eq!(filtered.len(), SIZE / 2, "wrong number of correct delivery");
+
+        batch
+            .into_iter()
+            .take(CONFLICT_RANGE.count())
+            .zip(filtered.iter())
+            .for_each(|(expected, actual)| {
+                assert_eq!(&expected, actual, "bad payload");
+            });
     }
 
     #[tokio::test]
-    async fn delivery_usize_no_network() {
-        sieve_test!(0, SIZE);
+    async fn reports_conflicts() {
+        use drop::crypto::sign::Signer;
+        use drop::test::DummyManager;
+
+        const RANGE: std::ops::Range<usize> = 5..8;
+
+        drop::test::init_logger();
+
+        let config = SieveConfig {
+            murmur: MurmurConfig {
+                sponge_threshold: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
+        let mut signer = Signer::random();
+        let sender = *signer.public();
+        // send 3 times a different payload with the same sequence number to
+        // provoke some conflict
+        let payloads = RANGE.map(|x| {
+            let signature = signer.sign(&x).expect("signing failed");
+            Payload::new(sender, 0, x, signature)
+        });
+
+        let batches: Vec<Batch<usize>> = payloads
+            .map(|payload| iter::once(iter::once(payload).collect()).collect())
+            .collect();
+
+        assert_eq!(batches.len(), RANGE.count());
+
+        let messages = batches.iter().cloned().flat_map(|batch| {
+            iter::once(MurmurMessage::Announce(*batch.info(), true))
+                .chain(generate_transmit(batch))
+                .map(Into::into)
+        });
+
+        let mut manager = DummyManager::new(messages, 10);
+
+        manager.run(sieve).await;
+
+        let conflicts = manager
+            .sender()
+            .messages()
+            .await
+            .into_iter()
+            .map(|x| x.1)
+            .fold(HashSet::new(), |mut acc, curr| match &*curr {
+                SieveMessage::ValidExcept(info, conflicts) => {
+                    acc.extend(iter::repeat(*info.digest()).zip(conflicts.iter().copied()));
+
+                    acc
+                }
+                _ => acc,
+            });
+
+        assert_eq!(
+            conflicts.len(),
+            RANGE.count() - 1,
+            "wrong number of conflicts"
+        );
     }
 
     #[tokio::test]
-    async fn delivery_enum_no_network() {
-        #[message]
-        enum T {
-            Ok,
-            Error,
-            Other,
-        }
+    async fn deliver_single_payload() {
+        drop::test::init_logger();
 
-        let msg = T::Error;
+        const SIZE: usize = 10;
+        const CONFLICT_RANGE: std::ops::Range<Sequence> = CONFLICT..(SIZE as Sequence);
+        const CONFLICT: Sequence = 5;
 
-        sieve_test!(msg, SIZE);
+        let batch = generate_batch(SIZE);
+        let info = *batch.info();
+
+        let announce = iter::once(MurmurMessage::Announce(info, true));
+        let murmur = announce
+            .chain(generate_transmit(batch.clone()))
+            .map(Into::into);
+        let messages = murmur
+            .chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE))
+            .chain(generate_single_ack(info, SIZE, CONFLICT));
+        let sieve = Sieve::default();
+        let mut manager = DummyManager::new(messages, SIZE);
+        let mut handle = manager.run(sieve).await;
+
+        let b1 = handle.deliver().await.expect("failed deliver");
+        let b2 = handle.deliver().await.expect("failed deliver");
+
+        assert_eq!(b1.len(), 5);
+        assert_eq!(b2.len(), 1);
     }
 
     #[tokio::test]
-    async fn broadcast_no_network() {
-        init_logger();
+    async fn deliver_no_conflict() {
+        drop::test::init_logger();
 
-        let keypair = Arc::new(KeyPair::random());
-        let (manager, signature) = create_sieve_manager(&keypair, MESSAGE, SIZE);
+        const SIZE: usize = 10;
 
-        let processor = Sieve::new_sender(keypair.clone(), SIZE / 5, SIZE / 3);
+        let batch = generate_batch(SIZE);
+        let info = *batch.info();
 
-        let mut handle = manager.run(processor).await;
+        let murmur = generate_transmit(batch.clone()).map(Into::into);
+        let sieve = generate_no_conflict(info, SIZE);
+        let announce = MurmurMessage::Announce(info, true).into();
+        let messages = iter::once(announce).chain(murmur.chain(sieve));
+        let mut manager = DummyManager::new(messages, SIZE);
 
-        handle.broadcast(&MESSAGE).await.expect("broadcast failed");
+        let sieve = Sieve::default();
 
-        let message = handle.deliver().await.expect("deliver failed");
+        let mut handle = manager.run(sieve).await;
 
-        Signer::random()
-            .verify(&signature, keypair.public(), &MESSAGE)
-            .expect("bad signature");
-        assert_eq!(message, MESSAGE, "wrong message delivered");
+        let filtered = handle.deliver().await.expect("no delivery");
+
+        assert_eq!(filtered.excluded_len(), 0, "wrong number of conflict");
+
+        batch
+            .into_iter()
+            .zip(filtered.iter())
+            .for_each(|(expected, actual)| {
+                assert_eq!(&expected, actual, "bad payload");
+            });
     }
 }

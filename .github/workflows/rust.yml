@@ -19,6 +19,9 @@ jobs:
           profile: minimal
           toolchain: ${{ matrix.rust }}
 
+      - uses: Swatinem/rust-cache@v1
+        name: caching
+
       - uses: actions-rs/cargo@v1
         name: cargo check
         with:
@@ -34,6 +37,30 @@ jobs:
         name: cargo test
         with:
           command: test
+
+  deny:
+    name: cargo deny checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        name: install toolchain
+        with:
+          profile: minimal
+          toolchain: stable
+
+      - uses: actions-rs/cargo@v1
+        name: install cargo deny
+        with:
+          command: install
+          args: cargo-deny
+
+      - uses: actions-rs/cargo@v1
+        name: cargo deny
+        with:
+          command: deny
+          args: check
 
   coverage:
     name: coverage testing
