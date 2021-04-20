@@ -90,10 +90,7 @@ where
 
         excluded.extend(range);
 
-        Self {
-            batch: self.batch.clone(),
-            excluded,
-        }
+        Self::new(self.batch.clone(), excluded)
     }
 
     /// Make a new `FilteredBatch` that only contains the specfified set of `Sequence`s
