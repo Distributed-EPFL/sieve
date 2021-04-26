@@ -390,7 +390,7 @@ where
 
                     if let Some(ack) = self.register_batch(batch).await? {
                         sender
-                            .send_many(Arc::new(ack), self.gossip.read().await.iter())
+                            .send_many(ack, self.gossip.read().await.iter())
                             .await
                             .context(Network)?;
                     }
@@ -401,7 +401,7 @@ where
         Ok(())
     }
 
-    async fn output<SA>(&mut self, sampler: Arc<SA>, sender: Arc<S>) -> Self::Handle
+    async fn setup<SA>(&mut self, sampler: Arc<SA>, sender: Arc<S>) -> Self::Handle
     where
         SA: Sampler,
     {
@@ -416,7 +416,7 @@ where
         self.gossip.write().await.extend(sample);
 
         let sender = Arc::new(ConvertSender::new(sender));
-        let handle = self.murmur.output(sampler, sender).await;
+        let handle = self.murmur.setup(sampler, sender).await;
 
         let (disp_tx, disp_rx) = dispatch::channel(self.config.murmur.channel_cap);
 
@@ -425,6 +425,36 @@ where
         self.delivery.replace(disp_tx);
 
         SieveHandle::new(handle, disp_rx)
+    }
+
+    async fn disconnect<SA: Sampler>(&self, peer: PublicKey, sender: Arc<S>, sampler: Arc<SA>) {
+        if self.gossip.read().await.contains(&peer) {
+            debug!("peer {} from our gossip set disconnected", peer);
+
+            let mut gossip = self.gossip.write().await;
+
+            gossip.remove(&peer);
+
+            let not_gossip = sender
+                .keys()
+                .await
+                .into_iter()
+                .filter(|x| !gossip.contains(&x));
+
+            if let Ok(new) = sampler.sample(not_gossip, 1).await {
+                debug!("resampled for {} new peers", new.len());
+
+                gossip.extend(new);
+            }
+        }
+
+        let sender = Arc::new(ConvertSender::new(sender));
+
+        self.murmur.disconnect(peer, sender, sampler).await;
+    }
+
+    async fn garbage_collection(&self) {
+        todo!()
     }
 }
 
@@ -677,7 +707,7 @@ pub mod test {
             .await
             .into_iter()
             .map(|x| x.1)
-            .fold(HashSet::new(), |mut acc, curr| match &*curr {
+            .fold(HashSet::new(), |mut acc, curr| match curr {
                 SieveMessage::ValidExcept(info, conflicts) => {
                     acc.extend(iter::repeat(*info.digest()).zip(conflicts.iter().copied()));
 
@@ -751,5 +781,58 @@ pub mod test {
             .for_each(|(expected, actual)| {
                 assert_eq!(&expected, actual, "bad payload");
             });
+    }
+
+    #[tokio::test]
+    async fn disconnect() {
+        use drop::system::sampler::AllSampler;
+        use drop::system::sender::CollectingSender;
+        use drop::test::keyset;
+
+        drop::test::init_logger();
+
+        let keys = keyset(10).collect::<Vec<_>>();
+        let mut sieve: Sieve<u32, _, _> = Sieve::default();
+
+        let sampler = Arc::new(AllSampler::default());
+        let sender = Arc::new(CollectingSender::new(keys.iter().copied()));
+
+        sieve.setup(sampler.clone(), sender.clone()).await;
+
+        assert_eq!(sieve.gossip.read().await.len(), keys.len());
+
+        let new_sender = Arc::new(CollectingSender::new(keys.iter().skip(1).copied()));
+
+        sieve.disconnect(keys[0], new_sender, sampler).await;
+
+        assert_eq!(sieve.gossip.read().await.len(), keys.len() - 1);
+    }
+
+    #[tokio::test]
+    async fn resample_after_disconnect() {
+        use drop::system::sampler::AllSampler;
+        use drop::system::sender::CollectingSender;
+        use drop::test::keyset;
+
+        drop::test::init_logger();
+
+        let keys = keyset(10).collect::<Vec<_>>();
+        let mut sieve: Sieve<u32, _, _> = Sieve::default();
+
+        let sampler = Arc::new(AllSampler::default());
+        let sender = Arc::new(CollectingSender::new(keys.iter().copied()));
+
+        sieve.setup(sampler.clone(), sender.clone()).await;
+
+        let new_sender = Arc::new(CollectingSender::new(
+            keys.iter().copied().skip(1).chain(keyset(1)),
+        ));
+
+        sieve.disconnect(keys[0], new_sender, sampler).await;
+
+        let gossip = sieve.gossip.read().await;
+
+        assert_eq!(gossip.len(), keys.len());
+        assert!(!gossip.contains(&keys[0]));
     }
 }
