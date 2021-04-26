@@ -139,7 +139,7 @@ where
     R: RdvPolicy,
 {
     pending: RwLock<HashMap<Digest, Arc<Batch<M>>>>,
-    murmur: Arc<Murmur<M, R>>,
+    murmur: Murmur<M, R>,
     handle: Option<Mutex<MurmurHandleAlias<M, S, R>>>,
     delivered: RwLock<HashMap<Digest, BTreeSet<Sequence>>>,
     delivery: Option<dispatch::Sender<FilteredBatch<M>>>,
@@ -165,7 +165,7 @@ where
     /// [`Sieve`]: self::Sieve
     /// [`SieveConfig`]: self::SieveConfig
     pub fn new(keypair: KeyPair, policy: R, config: SieveConfig) -> Self {
-        let murmur = Arc::new(Murmur::new(keypair, policy, config.murmur));
+        let murmur = Murmur::new(keypair, policy, config.murmur);
 
         Self {
             murmur,
@@ -372,7 +372,6 @@ where
                 let msender = Arc::new(ConvertSender::new(sender.clone()));
 
                 self.murmur
-                    .clone()
                     .process(Arc::new(murmur.clone()), from, msender)
                     .await
                     .context(MurmurFail)?;
@@ -417,10 +416,7 @@ where
         self.gossip.write().await.extend(sample);
 
         let sender = Arc::new(ConvertSender::new(sender));
-        let handle = Arc::get_mut(&mut self.murmur)
-            .expect("setup should be run first")
-            .output(sampler, sender)
-            .await;
+        let handle = self.murmur.output(sampler, sender).await;
 
         let (disp_tx, disp_rx) = dispatch::channel(self.config.murmur.channel_cap);
 
