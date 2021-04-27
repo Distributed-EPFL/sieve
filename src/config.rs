@@ -36,6 +36,7 @@ impl SieveConfig {
         have >= self.echo_threshold as i32
     }
 
+    /// Get the expiration delay for delivered batches
     pub fn expiration_delay(&self) -> Duration {
         self.murmur.batch_expiration()
     }
