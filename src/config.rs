@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use murmur::MurmurConfig;
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,10 @@ impl SieveConfig {
     /// Check if the  given argument is greater or equal to the threshold
     pub fn threshold_cmp(&self, have: i32) -> bool {
         have >= self.echo_threshold as i32
+    }
+
+    pub fn expiration_delay(&self) -> Duration {
+        self.murmur.batch_expiration()
     }
 }
 
