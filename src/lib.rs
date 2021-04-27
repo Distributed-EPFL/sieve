@@ -478,8 +478,11 @@ where
             self.echoes.purge(digest).await;
         }
 
-        // FIXME: type inferer doesn't seem to able to infer sender type on murmur
-        // self.murmur.garbage_collection().await;
+        // yes this is ugly, blame the type inferer
+        <Murmur<_, _> as Processor<_, _, _, ConvertSender<_, _, S>>>::garbage_collection(
+            &self.murmur,
+        )
+        .await;
     }
 }
 
@@ -859,5 +862,45 @@ pub mod test {
 
         assert_eq!(gossip.len(), keys.len());
         assert!(!gossip.contains(&keys[0]));
+    }
+
+    #[cfg(test)]
+    async fn garbage_collection_helper(
+        delay: u64,
+    ) -> Sieve<u32, drop::system::sender::CollectingSender<SieveMessage<u32>>, Fixed> {
+        let mut config = SieveConfig::default();
+        config.murmur.batch_expiration = delay;
+
+        let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
+        let batch = Arc::new(generate_batch(10));
+
+        sieve
+            .register_batch(batch)
+            .await
+            .expect("failed to register batch");
+
+        assert_eq!(
+            sieve.pending.read().await.len(),
+            1,
+            "batch wasn't inserted correctly"
+        );
+
+        <Sieve<_, _, _> as Processor<_, _, _, _>>::garbage_collection(&sieve).await;
+
+        sieve
+    }
+
+    #[tokio::test]
+    async fn garbage_collection() {
+        let sieve = garbage_collection_helper(0).await;
+
+        assert!(sieve.pending.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_early() {
+        let sieve = garbage_collection_helper(5).await;
+
+        assert_eq!(sieve.pending.read().await.len(), 1);
     }
 }
