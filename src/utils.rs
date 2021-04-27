@@ -261,8 +261,6 @@ impl EchoList {
 enum ConflictCommand {
     /// Check if the specified tuple is a conflict
     Check(sign::PublicKey, Sequence, Digest),
-    /// Purge all conflicts information
-    Purge(sign::PublicKey, Sequence),
 }
 
 /// Agent controller that manages conflicts registation
@@ -338,18 +336,6 @@ impl ConflictAgent {
                         if resp.send(hash != *conflict).is_err() {
                             error!("agent controller crashed during query");
                             return self;
-                        }
-                    }
-                    ConflictCommand::Purge(sender, lowest_seq) => {
-                        if let Some(conflicts) = self.registered.get_mut(&sender) {
-                            let to_remove = conflicts
-                                .range(..lowest_seq)
-                                .map(|x| x.0)
-                                .collect::<Vec<_>>();
-
-                            for seq in to_remove {
-                                conflicts.remove(seq);
-                            }
                         }
                     }
                 }
