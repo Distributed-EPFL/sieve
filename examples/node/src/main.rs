@@ -29,7 +29,7 @@ impl std::str::FromStr for PeerInfo {
     type Err = PeerParseError;
 
     fn from_str(v: &str) -> Result<Self, Self::Err> {
-        let components = v.split("-").collect::<Vec<_>>();
+        let components = v.split('-').collect::<Vec<_>>();
 
         if components.len() != 2 {
             return Err(PeerParseError::Invalid);
