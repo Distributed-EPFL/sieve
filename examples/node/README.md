@@ -2,7 +2,7 @@
 
 This is an example application that uses batched sieve to spread messages in a distributed system.
 
-This showcases the use of both drop and batched sieve for real-life applications (though it is very simple)
+This showcases the use of both drop and batched sieve for real-life applications (though it is very simple).
 
 For simplicity all arguments are provided on the command line. 
 
