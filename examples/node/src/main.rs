@@ -31,7 +31,7 @@ impl std::str::FromStr for PeerInfo {
     fn from_str(v: &str) -> Result<Self, Self::Err> {
         let components = v.split("-").collect::<Vec<_>>();
 
-        if components.len() < 2 {
+        if components.len() != 2 {
             return Err(PeerParseError::Invalid);
         }
 
