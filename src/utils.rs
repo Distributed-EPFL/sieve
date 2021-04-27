@@ -85,6 +85,11 @@ impl EchoHandle {
             .filter_map(|x| async move { x })
     }
 
+    /// Purge all echo information related to the specified Digest
+    pub async fn purge(&self, digest: Digest) {
+        self.send_command(Command::Purge(digest)).await;
+    }
+
     /// Internal helper to send commands to the agent
     async fn send_command(&self, cmd: Command) -> Option<i32> {
         let (tx, rx) = oneshot::channel();
@@ -152,6 +157,8 @@ enum Command {
     Received(Digest, PublicKey, Sequence),
     /// The specified payload conflicts for a remote peer
     Conflict(Digest, PublicKey, Sequence),
+    /// Purge all echo information
+    Purge(Digest),
 }
 
 struct EchoAgent {
@@ -185,6 +192,9 @@ impl EchoAgent {
                         let entry = self.echoes.entry(hash).or_default();
 
                         entry.conflicts(sequence, sender);
+                    }
+                    Command::Purge(digest) => {
+                        self.echoes.remove(&digest);
                     }
                 }
             }
@@ -249,7 +259,10 @@ impl EchoList {
 }
 
 enum ConflictCommand {
+    /// Check if the specified tuple is a conflict
     Check(sign::PublicKey, Sequence, Digest),
+    /// Purge all conflicts information
+    Purge(sign::PublicKey, Sequence),
 }
 
 /// Agent controller that manages conflicts registation
@@ -325,6 +338,18 @@ impl ConflictAgent {
                         if resp.send(hash != *conflict).is_err() {
                             error!("agent controller crashed during query");
                             return self;
+                        }
+                    }
+                    ConflictCommand::Purge(sender, lowest_seq) => {
+                        if let Some(conflicts) = self.registered.get_mut(&sender) {
+                            let to_remove = conflicts
+                                .range(..lowest_seq)
+                                .map(|x| x.0)
+                                .collect::<Vec<_>>();
+
+                            for seq in to_remove {
+                                conflicts.remove(seq);
+                            }
                         }
                     }
                 }
