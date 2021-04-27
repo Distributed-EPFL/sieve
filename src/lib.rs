@@ -38,6 +38,9 @@ pub use batch::FilteredBatch;
 mod config;
 pub use config::{SieveConfig, SieveConfigBuilder};
 
+mod structs;
+use structs::TimedBatch;
+
 mod utils;
 use utils::ConflictHandle;
 pub use utils::EchoHandle;
@@ -138,7 +141,7 @@ where
     S: Sender<SieveMessage<M>>,
     R: RdvPolicy,
 {
-    pending: RwLock<HashMap<Digest, Arc<Batch<M>>>>,
+    pending: RwLock<HashMap<Digest, TimedBatch<M>>>,
     murmur: Murmur<M, R>,
     handle: Option<Mutex<MurmurHandleAlias<M, S, R>>>,
     delivered: RwLock<HashMap<Digest, BTreeSet<Sequence>>>,
@@ -191,7 +194,7 @@ where
             Entry::Occupied(_) => Ok(None),
             Entry::Vacant(e) => {
                 let mut conflicts = Vec::new();
-                let batch = e.insert(batch);
+                let batch = e.insert(batch.into());
 
                 for (i, block) in batch.blocks().enumerate() {
                     for payload in block.iter() {
@@ -285,7 +288,7 @@ where
                 .read()
                 .await
                 .get(&digest)
-                .map(Clone::clone)
+                .map(Into::into)
                 .map(|batch| {
                     delivered.extend(&not_delivered);
                     debug!(
@@ -454,7 +457,29 @@ where
     }
 
     async fn garbage_collection(&self) {
-        todo!()
+        let mut batches = self.pending.write().await;
+        let mut delivered = self.delivered.write().await;
+
+        // FIXME: this should use `HashMap::drain_filter` once it is stabilized
+        let expired_digests = batches
+            .iter()
+            .filter_map(|(digest, batch)| {
+                if batch.is_expired(self.config.expiration_delay()) {
+                    Some(*digest)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for digest in expired_digests {
+            batches.remove(&digest);
+            delivered.remove(&digest);
+            self.echoes.purge(digest).await;
+        }
+
+        // FIXME: type inferer doesn't seem to able to infer sender type on murmur
+        // self.murmur.garbage_collection().await;
     }
 }
 
