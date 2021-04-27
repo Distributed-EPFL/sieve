@@ -8,7 +8,7 @@ use drop::system::manager::{Handle, SystemManager};
 use drop::system::sampler::AllSampler;
 use drop::system::System;
 
-use murmur::{Fixed, Payload, Sequence, Sieve, SieveConfig};
+use sieve::{Fixed, Payload, Sequence, Sieve, SieveConfig};
 
 use snafu::{ResultExt, Snafu};
 
@@ -61,7 +61,7 @@ enum PeerParseError {
 /// Command line argument processing is delegated to the structopt cratev
 struct NodeConfig {
     #[structopt(flatten)]
-    murmur: SieveConfig,
+    sieve: SieveConfig,
 
     #[structopt(short("-l"), long("--listen"))]
     /// Address to listen on for incoming connections
@@ -104,18 +104,18 @@ async fn main() {
 
     let manager = SystemManager::new(system);
 
-    // we now create the murmur instance we will use to broadcast and receive messages  from the network and
+    // we now create the sieve instance we will use to broadcast and receive messages  from the network and
     // set it up to use a local batching policy
-    // note that murmur takes a different kind of cryptographic keys since those are only used to sign messages
+    // note that sieve takes a different kind of cryptographic keys since those are only used to sign messages
     // and not to perform network communication
-    let murmur = Sieve::new(sign_keypair.clone(), Fixed::new_local(), config.murmur);
+    let sieve = Sieve::new(sign_keypair.clone(), Fixed::new_local(), config.sieve);
 
-    // we choose to use a deterministic version of murmur by selecting a sampler that takes every known peer
+    // we choose to use a deterministic version of sieve by selecting a sampler that takes every known peer
     let sampler = AllSampler::default();
 
-    // we now tell the system manager to start processing messages using murmur and get a handle allowing us to
-    // interact with murmur
-    let mut handle = manager.run(murmur, sampler).await;
+    // we now tell the system manager to start processing messages using sieve and get a handle allowing us to
+    // interact with sieve
+    let mut handle = manager.run(sieve, sampler).await;
 
     // now we start broadcasting all integers from 0 to 1999 on the network
     for i in 0..MESSAGE_COUNT {
