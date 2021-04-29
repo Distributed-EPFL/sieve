@@ -34,6 +34,11 @@ where
         Self { batch, excluded }
     }
 
+    /// Get the [`BatchInfo`] for this `FilteredBatch`
+    pub fn info(&self) -> &BatchInfo {
+        self.batch.info()
+    }
+
     /// Get the `Digest` from this `FilteredBatch`
     pub fn digest(&self) -> &Digest {
         &self.batch.info().digest()
