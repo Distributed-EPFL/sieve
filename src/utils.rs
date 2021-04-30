@@ -45,6 +45,27 @@ impl EchoHandle {
             .map(|echoes| (seq, echoes))
     }
 
+    /// Get echo count for the given sequences
+    pub async fn get_echoes(&self, digest: Digest, sequence: Sequence) -> Option<(Sequence, i32)> {
+        let (tx, rx) = oneshot::channel();
+
+        self.send_command(Command::GetEcho(digest, sequence, tx))
+            .await?;
+
+        rx.await.ok().map(|count| (sequence, count))
+    }
+
+    /// Get echo statuses for many different sequences in a batch
+    pub async fn get_many_echoes<'a>(
+        &'a self,
+        digest: Digest,
+        sequences: impl Iterator<Item = Sequence> + 'a,
+    ) -> impl Stream<Item = (Sequence, i32)> + 'a {
+        stream::iter(sequences)
+            .then(move |sequence| self.get_echoes(digest, sequence))
+            .filter_map(|x| async move { x })
+    }
+
     /// Register echoes for many different payloads at once
     pub async fn send_many<'a>(
         &'a self,
@@ -159,6 +180,8 @@ enum Command {
     Conflict(Digest, PublicKey, Sequence),
     /// Purge all echo information
     Purge(Digest),
+    /// Get echo count for a given sequence
+    GetEcho(Digest, Sequence, oneshot::Sender<i32>),
 }
 
 struct EchoAgent {
@@ -195,6 +218,11 @@ impl EchoAgent {
                     }
                     Command::Purge(digest) => {
                         self.echoes.remove(&digest);
+                    }
+                    Command::GetEcho(digest, sequence, resp) => {
+                        let echoes = self.echoes.entry(digest).or_default();
+
+                        let _ = resp.send(echoes.count(sequence));
                     }
                 }
             }
@@ -447,6 +475,34 @@ mod test {
         }
 
         assert_eq!(count, SIZE - 1, "wrong number of conflicts");
+    }
+
+    #[tokio::test]
+    async fn get_echo_count() {
+        const SIZE: usize = 10;
+
+        let handle = EchoHandle::default();
+        let batch = generate_batch(SIZE);
+        let digest = *batch.info().digest();
+        let keys: Vec<_> = keyset(SIZE).collect();
+
+        let sequences = 0..batch.info().sequence();
+
+        for (idx, key) in keys.into_iter().enumerate() {
+            handle
+                .send_many(digest, key, sequences.clone())
+                .await
+                .for_each(|(_, count)| async move {
+                    assert_eq!(count, (idx + 1) as i32);
+                })
+                .await;
+        }
+
+        handle
+            .get_many_echoes(digest, sequences)
+            .await
+            .for_each(|(_, count)| async move { assert_eq!(count, SIZE as i32) })
+            .await;
     }
 
     #[tokio::test]
