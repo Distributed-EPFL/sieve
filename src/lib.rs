@@ -314,7 +314,7 @@ where
             .clone()
             .send(batch)
             .await
-            .map_err(|_| snafu::NoneError)
+            .ok()
             .context(Channel)
     }
 }
@@ -391,11 +391,20 @@ where
                 if let Ok(Some(batch)) = delivery {
                     debug!("delivered a new batch via murmur");
 
+                    let size = batch.info().sequence();
+                    let digest = *batch.info().digest();
+
                     if let Some(ack) = self.register_batch(batch).await? {
                         sender
                             .send_many(ack, self.gossip.read().await.iter())
                             .await
                             .context(Network)?;
+                    }
+
+                    let sequences = 0..size;
+
+                    if let Some(batch) = self.deliverable(digest, stream::iter(sequences)).await {
+                        self.deliver(batch).await?;
                     }
                 }
             }
@@ -644,10 +653,14 @@ pub mod test {
         I::IntoIter: Clone,
     {
         let info = *batch.info();
-        let murmur = generate_transmit(batch).map(Into::into);
-        let sieve = generate_some_conflict(info, peer_count, conflicts.into_iter());
 
-        murmur.chain(sieve)
+        iter::once(MurmurMessage::Announce(info, true).into())
+            .chain(generate_transmit(batch).map(Into::into))
+            .chain(generate_some_conflict(
+                info,
+                peer_count,
+                conflicts.into_iter(),
+            ))
     }
 
     #[tokio::test]
@@ -659,10 +672,7 @@ pub mod test {
             (SIZE as Sequence / 2)..(SIZE as Sequence);
 
         let batch = generate_batch(SIZE);
-        let info = *batch.info();
-        let announce = MurmurMessage::Announce(info, true).into();
-        let murmur = iter::once(announce).chain(generate_transmit(batch.clone()).map(Into::into));
-        let messages = murmur.chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE));
+        let messages = generate_sieve_sequence(SIZE, batch.clone(), CONFLICT_RANGE);
         let mut manager = DummyManager::new(messages, SIZE);
         let sieve = Sieve::default();
 
@@ -762,13 +772,9 @@ pub mod test {
         let batch = generate_batch(SIZE);
         let info = *batch.info();
 
-        let announce = iter::once(MurmurMessage::Announce(info, true));
-        let murmur = announce
-            .chain(generate_transmit(batch.clone()))
-            .map(Into::into);
-        let messages = murmur
-            .chain(generate_some_conflict(info, SIZE, CONFLICT_RANGE))
+        let messages = generate_sieve_sequence(SIZE, batch, CONFLICT_RANGE)
             .chain(generate_single_ack(info, SIZE, CONFLICT));
+
         let sieve = Sieve::default();
         let mut manager = DummyManager::new(messages, SIZE);
         let mut handle = manager.run(sieve).await;
@@ -787,12 +793,8 @@ pub mod test {
         const SIZE: usize = 10;
 
         let batch = generate_batch(SIZE);
-        let info = *batch.info();
 
-        let murmur = generate_transmit(batch.clone()).map(Into::into);
-        let sieve = generate_no_conflict(info, SIZE);
-        let announce = MurmurMessage::Announce(info, true).into();
-        let messages = iter::once(announce).chain(murmur.chain(sieve));
+        let messages = generate_sieve_sequence(SIZE, batch.clone(), iter::empty());
         let mut manager = DummyManager::new(messages, SIZE);
 
         let sieve = Sieve::default();
@@ -809,6 +811,36 @@ pub mod test {
             .for_each(|(expected, actual)| {
                 assert_eq!(&expected, actual, "bad payload");
             });
+    }
+
+    #[tokio::test]
+    async fn only_delivers_once() {
+        drop::test::init_logger();
+
+        const SIZE: usize = 10;
+
+        let batch = generate_batch(SIZE);
+
+        let messages = generate_sieve_sequence(SIZE, batch, iter::empty());
+
+        let mut manager = DummyManager::new(messages, SIZE);
+        let sieve = Sieve::default();
+
+        let mut handle = manager.run(sieve).await;
+        let mut seqs = Vec::with_capacity(SIZE);
+
+        while let Ok(batch) = handle.deliver().await {
+            seqs.extend(batch.included());
+        }
+
+        seqs.sort_unstable();
+
+        assert_eq!(seqs.len(), SIZE, "wrong delivery count");
+        assert_eq!(
+            seqs,
+            (0..SIZE as Sequence).collect::<Vec<_>>(),
+            "incorrect sequence delivery"
+        );
     }
 
     #[tokio::test]
