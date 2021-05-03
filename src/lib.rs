@@ -332,11 +332,11 @@ where
 
     async fn process(
         &self,
-        message: Arc<SieveMessage<M>>,
+        message: SieveMessage<M>,
         from: PublicKey,
         sender: Arc<S>,
     ) -> Result<(), Self::Error> {
-        match &*message {
+        match message {
             SieveMessage::ValidExcept(ref info, ref sequences) => {
                 debug!(
                     "acknowledged {} payloads from batch {}",
@@ -375,7 +375,7 @@ where
                 let msender = Arc::new(ConvertSender::new(sender.clone()));
 
                 self.murmur
-                    .process(Arc::new(murmur.clone()), from, msender)
+                    .process(murmur, from, msender)
                     .await
                     .context(MurmurFail)?;
 
