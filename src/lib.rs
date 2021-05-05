@@ -178,7 +178,7 @@ where
             delivered: Default::default(),
             handle: Default::default(),
             gossip: Default::default(),
-            echoes: EchoHandle::new(32),
+            echoes: EchoHandle::new(config.channel_cap(), "sieve"),
             conflicts: ConflictHandle::new(32),
         }
     }

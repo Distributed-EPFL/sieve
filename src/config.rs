@@ -40,6 +40,11 @@ impl SieveConfig {
     pub fn expiration_delay(&self) -> Duration {
         self.murmur.batch_expiration()
     }
+
+    /// Get the channel capacity for this configuration
+    pub fn channel_cap(&self) -> usize {
+        self.murmur.channel_cap
+    }
 }
 
 impl Default for SieveConfig {
