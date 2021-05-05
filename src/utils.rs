@@ -12,7 +12,8 @@ use murmur::Sequence;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{self, JoinHandle};
 
-use tracing::error;
+use tracing::{error, trace, trace_span};
+use tracing_futures::Instrument;
 
 /// A convenient struct to manage conflicts between `Batch`es. <br />
 /// If any of the methods of this returns either `None` or `false` the associated
@@ -24,11 +25,12 @@ pub struct EchoHandle {
 
 impl EchoHandle {
     /// Create a new `EchoController` with a channel buffer of `cap`
-    pub fn new(cap: usize) -> Self {
+    pub fn new(cap: usize, name: &str) -> Self {
         let (tx, rx) = mpsc::channel(cap);
 
         let manager = EchoAgent::new(rx);
-        manager.process_loop();
+
+        manager.spawn(name);
 
         Self { command: tx }
     }
@@ -61,6 +63,8 @@ impl EchoHandle {
         digest: Digest,
         sequences: impl Iterator<Item = Sequence> + 'a,
     ) -> impl Stream<Item = (Sequence, i32)> + 'a {
+        debug!("getting many echoes for {}", digest);
+
         stream::iter(sequences)
             .then(move |sequence| self.get_echoes(digest, sequence))
             .filter_map(|x| async move { x })
@@ -73,6 +77,8 @@ impl EchoHandle {
         from: PublicKey,
         checks: impl IntoIterator<Item = Sequence> + 'a,
     ) -> impl Stream<Item = (Sequence, i32)> + 'a {
+        debug!("registering new echoes from {} for {}", from, batch);
+
         checks
             .into_iter()
             .map(|seq| self.send(batch, from, seq))
@@ -125,7 +131,7 @@ impl EchoHandle {
 
 impl Default for EchoHandle {
     fn default() -> Self {
-        Self::new(128)
+        Self::new(128, "default")
     }
 }
 
@@ -197,38 +203,50 @@ impl EchoAgent {
         }
     }
 
+    fn spawn(self, name: &str) -> JoinHandle<Self> {
+        task::spawn(
+            self.process_loop()
+                .instrument(trace_span!("echo_agent", name=%name)),
+        )
+    }
+
     /// Start the processing loop for this `ConflictManager`
-    fn process_loop(mut self) -> JoinHandle<Self> {
-        task::spawn(async move {
-            while let Some((command, tx)) = self.receiver.recv().await {
-                match command {
-                    Command::Received(hash, sender, sequence) => {
-                        let entry = self.echoes.entry(hash).or_default();
-                        let conflicts = entry.echo(sequence, sender);
+    async fn process_loop(mut self) -> Self {
+        debug!("started echo agent");
 
-                        if tx.send(conflicts).is_err() {
-                            error!("agent controller has died");
-                            return self;
-                        }
-                    }
-                    Command::Conflict(hash, sender, sequence) => {
-                        let entry = self.echoes.entry(hash).or_default();
+        while let Some((command, tx)) = self.receiver.recv().await {
+            match command {
+                Command::Received(hash, sender, sequence) => {
+                    let entry = self.echoes.entry(hash).or_default();
+                    let conflicts = entry.echo(sequence, sender);
 
-                        entry.conflicts(sequence, sender);
-                    }
-                    Command::Purge(digest) => {
-                        self.echoes.remove(&digest);
-                    }
-                    Command::GetEcho(digest, sequence, resp) => {
-                        let echoes = self.echoes.entry(digest).or_default();
+                    trace!("updating echo count for {} of {}", sequence, hash);
 
-                        let _ = resp.send(echoes.count(sequence));
+                    if tx.send(conflicts).is_err() {
+                        error!("agent controller has died");
+                        return self;
                     }
                 }
-            }
+                Command::Conflict(hash, sender, sequence) => {
+                    let entry = self.echoes.entry(hash).or_default();
 
-            self
-        })
+                    entry.conflicts(sequence, sender);
+                }
+                Command::Purge(digest) => {
+                    self.echoes.remove(&digest);
+                }
+                Command::GetEcho(digest, sequence, resp) => {
+                    trace!("getting echo count for {} of {}", sequence, digest);
+                    let echoes = self.echoes.entry(digest).or_default();
+
+                    let _ = resp.send(echoes.count(sequence));
+                }
+            }
+        }
+
+        debug!("echo agent exiting");
+
+        self
     }
 }
 
