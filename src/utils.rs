@@ -65,7 +65,17 @@ impl EchoHandle {
     ) -> impl Stream<Item = (Sequence, i32)> + 'a {
         debug!("getting many echoes for {}", digest);
 
-        stream::iter(sequences)
+        self.get_many_echoes_stream(digest, stream::iter(sequences))
+            .await
+    }
+
+    /// Get the echo count for many sequences from a `Stream`
+    pub async fn get_many_echoes_stream<'a>(
+        &'a self,
+        digest: Digest,
+        sequences: impl Stream<Item = Sequence> + 'a,
+    ) -> impl Stream<Item = (Sequence, i32)> + 'a {
+        sequences
             .then(move |sequence| self.get_echoes(digest, sequence))
             .filter_map(|x| async move { x })
     }
