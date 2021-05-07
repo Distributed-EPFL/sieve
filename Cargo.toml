@@ -1,11 +1,12 @@
 [package]
 name = "sieve"
 version = "0.1.0"
-authors = ["Ogier Bouvier <ars3nic@ars3nic.ch>"]
+authors = ["Ogier Bouvier <ogier@bouvier.family>"]
 edition = "2018"
+readme = "README.md"
+description = "An implementation of probabilistic consistent broadcast"
+repository = "https://github.com/Distributed-EPFL/sieve"
 license = "AGPL-3.0-or-later"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", features = [ "system" ] }
