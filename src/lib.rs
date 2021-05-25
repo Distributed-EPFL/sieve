@@ -12,9 +12,9 @@ use drop::async_trait;
 use drop::crypto::hash::{hash, Digest, HashError};
 use drop::crypto::key::exchange::PublicKey;
 use drop::crypto::sign::{self, KeyPair};
-use drop::system::manager::Handle;
-use drop::system::sender::ConvertSender;
-use drop::system::{message, Message, Processor, SampleError, Sampler, Sender, SenderError};
+use drop::system::{
+    message, ConvertSender, Handle, Message, Processor, SampleError, Sampler, Sender, SenderError,
+};
 
 use futures::{stream, Stream, StreamExt};
 
@@ -845,8 +845,7 @@ pub mod test {
 
     #[tokio::test]
     async fn disconnect() {
-        use drop::system::sampler::AllSampler;
-        use drop::system::sender::CollectingSender;
+        use drop::system::{AllSampler, CollectingSender};
         use drop::test::keyset;
 
         drop::test::init_logger();
@@ -870,8 +869,7 @@ pub mod test {
 
     #[tokio::test]
     async fn resample_after_disconnect() {
-        use drop::system::sampler::AllSampler;
-        use drop::system::sender::CollectingSender;
+        use drop::system::{AllSampler, CollectingSender};
         use drop::test::keyset;
 
         drop::test::init_logger();
@@ -899,7 +897,7 @@ pub mod test {
     #[cfg(test)]
     async fn garbage_collection_helper(
         delay: u64,
-    ) -> Sieve<u32, drop::system::sender::CollectingSender<SieveMessage<u32>>, Fixed> {
+    ) -> Sieve<u32, drop::system::CollectingSender<SieveMessage<u32>>, Fixed> {
         let mut config = SieveConfig::default();
         config.murmur.batch_expiration = delay;
 
