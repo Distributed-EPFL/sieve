@@ -24,6 +24,7 @@ derive_builder = "0.10"
 [dev-dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", features = [ "test" ] }
 murmur = { git = "https://github.com/Distributed-EPFL/murmur", features = [ "test" ] }
+tokio = { version = "1.0", features = [ "macros" ] }
 
 [features]
 default = []
