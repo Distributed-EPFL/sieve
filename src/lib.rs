@@ -589,9 +589,6 @@ pub mod test {
 
     use std::iter;
 
-    #[cfg(test)]
-    use drop::test::DummyManager;
-
     pub use murmur::test::*;
 
     /// Generate a sieve acknowledgment for a single payload in a batch
@@ -663,274 +660,281 @@ pub mod test {
             ))
     }
 
-    #[tokio::test]
-    async fn deliver_some_conflict() {
-        drop::test::init_logger();
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-        const SIZE: usize = 10;
-        const CONFLICT_RANGE: std::ops::Range<Sequence> =
-            (SIZE as Sequence / 2)..(SIZE as Sequence);
-
-        let batch = generate_batch(SIZE);
-        let messages = generate_sieve_sequence(SIZE, batch.clone(), CONFLICT_RANGE);
-        let mut manager = DummyManager::new(messages, SIZE);
-        let sieve = Sieve::default();
-
-        let mut handle = manager.run(sieve).await;
-
-        let filtered = handle.deliver().await.expect("no delivery");
-
-        assert_eq!(
-            filtered.excluded_len(),
-            CONFLICT_RANGE.count(),
-            "wrong number of conflicts"
-        );
-        assert_eq!(filtered.len(), SIZE / 2, "wrong number of correct delivery");
-
-        batch
-            .into_iter()
-            .take(CONFLICT_RANGE.count())
-            .zip(filtered.iter())
-            .for_each(|(expected, actual)| {
-                assert_eq!(&expected, actual, "bad payload");
-            });
-    }
-
-    #[tokio::test]
-    async fn reports_conflicts() {
-        use drop::crypto::sign::Signer;
         use drop::test::DummyManager;
 
-        const RANGE: std::ops::Range<usize> = 5..8;
+        #[tokio::test]
+        async fn deliver_some_conflict() {
+            drop::test::init_logger();
 
-        drop::test::init_logger();
+            const SIZE: usize = 10;
+            const CONFLICT_RANGE: std::ops::Range<Sequence> =
+                (SIZE as Sequence / 2)..(SIZE as Sequence);
 
-        let config = SieveConfig {
-            murmur: MurmurConfig {
-                sponge_threshold: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+            let batch = generate_batch(SIZE);
+            let messages = generate_sieve_sequence(SIZE, batch.clone(), CONFLICT_RANGE);
+            let mut manager = DummyManager::new(messages, SIZE);
+            let sieve = Sieve::default();
 
-        let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
-        let mut signer = Signer::random();
-        let sender = *signer.public();
-        // send 3 times a different payload with the same sequence number to
-        // provoke some conflict
-        let payloads = RANGE.map(|x| {
-            let signature = signer.sign(&x).expect("signing failed");
-            Payload::new(sender, 0, x, signature)
-        });
+            let mut handle = manager.run(sieve).await;
 
-        let batches: Vec<Batch<usize>> = payloads
-            .map(|payload| iter::once(iter::once(payload).collect()).collect())
-            .collect();
+            let filtered = handle.deliver().await.expect("no delivery");
 
-        assert_eq!(batches.len(), RANGE.count());
+            assert_eq!(
+                filtered.excluded_len(),
+                CONFLICT_RANGE.count(),
+                "wrong number of conflicts"
+            );
+            assert_eq!(filtered.len(), SIZE / 2, "wrong number of correct delivery");
 
-        let messages = batches.iter().cloned().flat_map(|batch| {
-            iter::once(MurmurMessage::Announce(*batch.info(), true))
-                .chain(generate_transmit(batch))
-                .map(Into::into)
-        });
-
-        let mut manager = DummyManager::new(messages, 10);
-
-        manager.run(sieve).await;
-
-        let conflicts = manager
-            .sender()
-            .messages()
-            .await
-            .into_iter()
-            .map(|x| x.1)
-            .fold(HashSet::new(), |mut acc, curr| match curr {
-                SieveMessage::ValidExcept(info, conflicts) => {
-                    acc.extend(iter::repeat(*info.digest()).zip(conflicts.iter().copied()));
-
-                    acc
-                }
-                _ => acc,
-            });
-
-        assert_eq!(
-            conflicts.len(),
-            RANGE.count() - 1,
-            "wrong number of conflicts"
-        );
-    }
-
-    #[tokio::test]
-    async fn deliver_single_payload() {
-        drop::test::init_logger();
-
-        const SIZE: usize = 10;
-        const CONFLICT_RANGE: std::ops::Range<Sequence> = CONFLICT..(SIZE as Sequence);
-        const CONFLICT: Sequence = 5;
-
-        let batch = generate_batch(SIZE);
-        let info = *batch.info();
-
-        let messages = generate_sieve_sequence(SIZE, batch, CONFLICT_RANGE)
-            .chain(generate_single_ack(info, SIZE, CONFLICT));
-
-        let sieve = Sieve::default();
-        let mut manager = DummyManager::new(messages, SIZE);
-        let mut handle = manager.run(sieve).await;
-
-        let b1 = handle.deliver().await.expect("failed deliver");
-        let b2 = handle.deliver().await.expect("failed deliver");
-
-        assert_eq!(b1.len(), 5);
-        assert_eq!(b2.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn deliver_no_conflict() {
-        drop::test::init_logger();
-
-        const SIZE: usize = 10;
-
-        let batch = generate_batch(SIZE);
-
-        let messages = generate_sieve_sequence(SIZE, batch.clone(), iter::empty());
-        let mut manager = DummyManager::new(messages, SIZE);
-
-        let sieve = Sieve::default();
-
-        let mut handle = manager.run(sieve).await;
-
-        let filtered = handle.deliver().await.expect("no delivery");
-
-        assert_eq!(filtered.excluded_len(), 0, "wrong number of conflict");
-
-        batch
-            .into_iter()
-            .zip(filtered.iter())
-            .for_each(|(expected, actual)| {
-                assert_eq!(&expected, actual, "bad payload");
-            });
-    }
-
-    #[tokio::test]
-    async fn only_delivers_once() {
-        drop::test::init_logger();
-
-        const SIZE: usize = 10;
-
-        let batch = generate_batch(SIZE);
-
-        let messages = generate_sieve_sequence(SIZE, batch, iter::empty());
-
-        let mut manager = DummyManager::new(messages, SIZE);
-        let sieve = Sieve::default();
-
-        let mut handle = manager.run(sieve).await;
-        let mut seqs = Vec::with_capacity(SIZE);
-
-        while let Ok(batch) = handle.deliver().await {
-            seqs.extend(batch.included());
+            batch
+                .into_iter()
+                .take(CONFLICT_RANGE.count())
+                .zip(filtered.iter())
+                .for_each(|(expected, actual)| {
+                    assert_eq!(&expected, actual, "bad payload");
+                });
         }
 
-        seqs.sort_unstable();
+        #[tokio::test]
+        async fn reports_conflicts() {
+            use drop::crypto::sign::Signer;
+            use drop::test::DummyManager;
 
-        assert_eq!(seqs.len(), SIZE, "wrong delivery count");
-        assert_eq!(
-            seqs,
-            (0..SIZE as Sequence).collect::<Vec<_>>(),
-            "incorrect sequence delivery"
-        );
-    }
+            const RANGE: std::ops::Range<usize> = 5..8;
 
-    #[tokio::test]
-    async fn disconnect() {
-        use drop::system::{AllSampler, CollectingSender};
-        use drop::test::keyset;
+            drop::test::init_logger();
 
-        drop::test::init_logger();
+            let config = SieveConfig {
+                murmur: MurmurConfig {
+                    sponge_threshold: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
 
-        let keys = keyset(10).collect::<Vec<_>>();
-        let mut sieve: Sieve<u32, _, _> = Sieve::default();
+            let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
+            let mut signer = Signer::random();
+            let sender = *signer.public();
+            // send 3 times a different payload with the same sequence number to
+            // provoke some conflict
+            let payloads = RANGE.map(|x| {
+                let signature = signer.sign(&x).expect("signing failed");
+                Payload::new(sender, 0, x, signature)
+            });
 
-        let sampler = Arc::new(AllSampler::default());
-        let sender = Arc::new(CollectingSender::new(keys.iter().copied()));
+            let batches: Vec<Batch<usize>> = payloads
+                .map(|payload| iter::once(iter::once(payload).collect()).collect())
+                .collect();
 
-        sieve.setup(sampler.clone(), sender.clone()).await;
+            assert_eq!(batches.len(), RANGE.count());
 
-        assert_eq!(sieve.gossip.read().await.len(), keys.len());
+            let messages = batches.iter().cloned().flat_map(|batch| {
+                iter::once(MurmurMessage::Announce(*batch.info(), true))
+                    .chain(generate_transmit(batch))
+                    .map(Into::into)
+            });
 
-        let new_sender = Arc::new(CollectingSender::new(keys.iter().skip(1).copied()));
+            let mut manager = DummyManager::new(messages, 10);
 
-        sieve.disconnect(keys[0], new_sender, sampler).await;
+            manager.run(sieve).await;
 
-        assert_eq!(sieve.gossip.read().await.len(), keys.len() - 1);
-    }
+            let conflicts = manager
+                .sender()
+                .messages()
+                .await
+                .into_iter()
+                .map(|x| x.1)
+                .fold(HashSet::new(), |mut acc, curr| match curr {
+                    SieveMessage::ValidExcept(info, conflicts) => {
+                        acc.extend(iter::repeat(*info.digest()).zip(conflicts.iter().copied()));
 
-    #[tokio::test]
-    async fn resample_after_disconnect() {
-        use drop::system::{AllSampler, CollectingSender};
-        use drop::test::keyset;
+                        acc
+                    }
+                    _ => acc,
+                });
 
-        drop::test::init_logger();
+            assert_eq!(
+                conflicts.len(),
+                RANGE.count() - 1,
+                "wrong number of conflicts"
+            );
+        }
 
-        let keys = keyset(10).collect::<Vec<_>>();
-        let mut sieve: Sieve<u32, _, _> = Sieve::default();
+        #[tokio::test]
+        async fn deliver_single_payload() {
+            drop::test::init_logger();
 
-        let sampler = Arc::new(AllSampler::default());
-        let sender = Arc::new(CollectingSender::new(keys.iter().copied()));
+            const SIZE: usize = 10;
+            const CONFLICT_RANGE: std::ops::Range<Sequence> = CONFLICT..(SIZE as Sequence);
+            const CONFLICT: Sequence = 5;
 
-        sieve.setup(sampler.clone(), sender.clone()).await;
+            let batch = generate_batch(SIZE);
+            let info = *batch.info();
 
-        let new_sender = Arc::new(CollectingSender::new(
-            keys.iter().copied().skip(1).chain(keyset(1)),
-        ));
+            let messages = generate_sieve_sequence(SIZE, batch, CONFLICT_RANGE)
+                .chain(generate_single_ack(info, SIZE, CONFLICT));
 
-        sieve.disconnect(keys[0], new_sender, sampler).await;
+            let sieve = Sieve::default();
+            let mut manager = DummyManager::new(messages, SIZE);
+            let mut handle = manager.run(sieve).await;
 
-        let gossip = sieve.gossip.read().await;
+            let b1 = handle.deliver().await.expect("failed deliver");
+            let b2 = handle.deliver().await.expect("failed deliver");
 
-        assert_eq!(gossip.len(), keys.len());
-        assert!(!gossip.contains(&keys[0]));
-    }
+            assert_eq!(b1.len(), 5);
+            assert_eq!(b2.len(), 1);
+        }
 
-    #[cfg(test)]
-    async fn garbage_collection_helper(
-        delay: u64,
-    ) -> Sieve<u32, drop::system::CollectingSender<SieveMessage<u32>>, Fixed> {
-        let mut config = SieveConfig::default();
-        config.murmur.batch_expiration = delay;
+        #[tokio::test]
+        async fn deliver_no_conflict() {
+            drop::test::init_logger();
 
-        let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
-        let batch = Arc::new(generate_batch(10));
+            const SIZE: usize = 10;
 
-        sieve
-            .register_batch(batch)
-            .await
-            .expect("failed to register batch");
+            let batch = generate_batch(SIZE);
 
-        assert_eq!(
-            sieve.pending.read().await.len(),
-            1,
-            "batch wasn't inserted correctly"
-        );
+            let messages = generate_sieve_sequence(SIZE, batch.clone(), iter::empty());
+            let mut manager = DummyManager::new(messages, SIZE);
 
-        <Sieve<_, _, _> as Processor<_, _, _, _>>::garbage_collection(&sieve).await;
+            let sieve = Sieve::default();
 
-        sieve
-    }
+            let mut handle = manager.run(sieve).await;
 
-    #[tokio::test]
-    async fn garbage_collection() {
-        let sieve = garbage_collection_helper(0).await;
+            let filtered = handle.deliver().await.expect("no delivery");
 
-        assert!(sieve.pending.read().await.is_empty());
-    }
+            assert_eq!(filtered.excluded_len(), 0, "wrong number of conflict");
 
-    #[tokio::test]
-    async fn garbage_collection_early() {
-        let sieve = garbage_collection_helper(5).await;
+            batch
+                .into_iter()
+                .zip(filtered.iter())
+                .for_each(|(expected, actual)| {
+                    assert_eq!(&expected, actual, "bad payload");
+                });
+        }
 
-        assert_eq!(sieve.pending.read().await.len(), 1);
+        #[tokio::test]
+        async fn only_delivers_once() {
+            drop::test::init_logger();
+
+            const SIZE: usize = 10;
+
+            let batch = generate_batch(SIZE);
+
+            let messages = generate_sieve_sequence(SIZE, batch, iter::empty());
+
+            let mut manager = DummyManager::new(messages, SIZE);
+            let sieve = Sieve::default();
+
+            let mut handle = manager.run(sieve).await;
+            let mut seqs = Vec::with_capacity(SIZE);
+
+            while let Ok(batch) = handle.deliver().await {
+                seqs.extend(batch.included());
+            }
+
+            seqs.sort_unstable();
+
+            assert_eq!(seqs.len(), SIZE, "wrong delivery count");
+            assert_eq!(
+                seqs,
+                (0..SIZE as Sequence).collect::<Vec<_>>(),
+                "incorrect sequence delivery"
+            );
+        }
+
+        #[tokio::test]
+        async fn disconnect() {
+            use drop::system::{AllSampler, CollectingSender};
+            use drop::test::keyset;
+
+            drop::test::init_logger();
+
+            let keys = keyset(10).collect::<Vec<_>>();
+            let mut sieve: Sieve<u32, _, _> = Sieve::default();
+
+            let sampler = Arc::new(AllSampler::default());
+            let sender = Arc::new(CollectingSender::new(keys.iter().copied()));
+
+            sieve.setup(sampler.clone(), sender.clone()).await;
+
+            assert_eq!(sieve.gossip.read().await.len(), keys.len());
+
+            let new_sender = Arc::new(CollectingSender::new(keys.iter().skip(1).copied()));
+
+            sieve.disconnect(keys[0], new_sender, sampler).await;
+
+            assert_eq!(sieve.gossip.read().await.len(), keys.len() - 1);
+        }
+
+        #[tokio::test]
+        async fn resample_after_disconnect() {
+            use drop::system::{AllSampler, CollectingSender};
+            use drop::test::keyset;
+
+            drop::test::init_logger();
+
+            let keys = keyset(10).collect::<Vec<_>>();
+            let mut sieve: Sieve<u32, _, _> = Sieve::default();
+
+            let sampler = Arc::new(AllSampler::default());
+            let sender = Arc::new(CollectingSender::new(keys.iter().copied()));
+
+            sieve.setup(sampler.clone(), sender.clone()).await;
+
+            let new_sender = Arc::new(CollectingSender::new(
+                keys.iter().copied().skip(1).chain(keyset(1)),
+            ));
+
+            sieve.disconnect(keys[0], new_sender, sampler).await;
+
+            let gossip = sieve.gossip.read().await;
+
+            assert_eq!(gossip.len(), keys.len());
+            assert!(!gossip.contains(&keys[0]));
+        }
+
+        #[cfg(test)]
+        async fn garbage_collection_helper(
+            delay: u64,
+        ) -> Sieve<u32, drop::system::CollectingSender<SieveMessage<u32>>, Fixed> {
+            let mut config = SieveConfig::default();
+            config.murmur.batch_expiration = delay;
+
+            let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
+            let batch = Arc::new(generate_batch(10));
+
+            sieve
+                .register_batch(batch)
+                .await
+                .expect("failed to register batch");
+
+            assert_eq!(
+                sieve.pending.read().await.len(),
+                1,
+                "batch wasn't inserted correctly"
+            );
+
+            <Sieve<_, _, _> as Processor<_, _, _, _>>::garbage_collection(&sieve).await;
+
+            sieve
+        }
+
+        #[tokio::test]
+        async fn garbage_collection() {
+            let sieve = garbage_collection_helper(0).await;
+
+            assert!(sieve.pending.read().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn garbage_collection_early() {
+            let sieve = garbage_collection_helper(5).await;
+
+            assert_eq!(sieve.pending.read().await.len(), 1);
+        }
     }
 }
