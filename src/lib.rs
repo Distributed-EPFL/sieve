@@ -11,7 +11,7 @@ use std::sync::Arc;
 use drop::async_trait;
 use drop::crypto::hash::{hash, Digest, HashError};
 use drop::crypto::key::exchange::PublicKey;
-use drop::crypto::sign::{self, KeyPair};
+use drop::crypto::sign;
 use drop::system::{
     message, ConvertSender, Handle, Message, Processor, SampleError, Sampler, Sender, SenderError,
 };
@@ -167,8 +167,8 @@ where
     ///
     /// [`Sieve`]: self::Sieve
     /// [`SieveConfig`]: self::SieveConfig
-    pub fn new(keypair: KeyPair, policy: R, config: SieveConfig) -> Self {
-        let murmur = Murmur::new(keypair, policy, config.murmur);
+    pub fn new(policy: R, config: SieveConfig) -> Self {
+        let murmur = Murmur::new(policy, config.murmur);
 
         Self {
             murmur,
@@ -501,11 +501,7 @@ where
     S: Sender<SieveMessage<M>>,
 {
     fn default() -> Self {
-        Self::new(
-            KeyPair::random(),
-            Fixed::new_local(),
-            SieveConfig::default(),
-        )
+        Self::new(Fixed::new_local(), SieveConfig::default())
     }
 }
 
@@ -664,6 +660,7 @@ pub mod test {
     mod tests {
         use super::*;
 
+        use drop::crypto::sign::KeyPair;
         use drop::test::DummyManager;
 
         #[tokio::test]
@@ -701,7 +698,6 @@ pub mod test {
 
         #[tokio::test]
         async fn reports_conflicts() {
-            use drop::crypto::sign::Signer;
             use drop::test::DummyManager;
 
             const RANGE: std::ops::Range<usize> = 5..8;
@@ -716,9 +712,9 @@ pub mod test {
                 ..Default::default()
             };
 
-            let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
-            let mut signer = Signer::random();
-            let sender = *signer.public();
+            let sieve = Sieve::new(Fixed::new_local(), config);
+            let signer = KeyPair::random();
+            let sender = signer.public();
             // send 3 times a different payload with the same sequence number to
             // provoke some conflict
             let payloads = RANGE.map(|x| {
@@ -904,7 +900,7 @@ pub mod test {
             let mut config = SieveConfig::default();
             config.murmur.batch_expiration = delay;
 
-            let sieve = Sieve::new(KeyPair::random(), Fixed::new_local(), config);
+            let sieve = Sieve::new(Fixed::new_local(), config);
             let batch = Arc::new(generate_batch(10));
 
             sieve
