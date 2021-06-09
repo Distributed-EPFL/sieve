@@ -482,8 +482,10 @@ mod test {
         const SEQUENCE: Sequence = 0u32;
         const SIZE: usize = 10;
 
+        use drop::crypto::sign::KeyPair;
+
         let manager = ConflictHandle::default();
-        let sender = *KeyPair::random().public();
+        let sender = KeyPair::random().public();
         let conflicts = (0..SIZE).map(|x| {
             let digest = hash(&x).expect("hash failed");
 
