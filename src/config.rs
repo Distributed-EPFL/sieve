@@ -33,7 +33,7 @@ pub struct SieveConfig {
 impl SieveConfig {
     /// Check if the  given argument is greater or equal to the threshold
     pub fn threshold_cmp(&self, have: i32) -> bool {
-        have >= self.echo_threshold as i32
+        have > 0 && have as usize >= self.echo_threshold
     }
 
     /// Get the expiration delay for delivered batches
