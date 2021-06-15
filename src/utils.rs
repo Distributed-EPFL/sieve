@@ -20,7 +20,7 @@ use tracing_futures::Instrument;
 /// agent has crashed and should be restarted
 #[derive(Clone)]
 pub struct EchoHandle {
-    command: mpsc::Sender<(Command, oneshot::Sender<i32>)>,
+    command: mpsc::Sender<Command>,
 }
 
 impl EchoHandle {
@@ -42,17 +42,24 @@ impl EchoHandle {
         sender: PublicKey,
         seq: Sequence,
     ) -> Option<(Sequence, i32)> {
-        self.send_command(Command::Received(batch, sender, seq))
+        let (tx, rx) = oneshot::channel();
+
+        self.command
+            .send(Command::Received(batch, sender, seq, tx))
             .await
-            .map(|echoes| (seq, echoes))
+            .ok()?;
+
+        rx.await.ok().map(|echoes| (seq, echoes))
     }
 
     /// Get echo count for the given sequences
     pub async fn get_echoes(&self, digest: Digest, sequence: Sequence) -> Option<(Sequence, i32)> {
         let (tx, rx) = oneshot::channel();
 
-        self.send_command(Command::GetEcho(digest, sequence, tx))
-            .await?;
+        self.command
+            .send(Command::GetEcho(digest, sequence, tx))
+            .await
+            .ok()?;
 
         rx.await.ok().map(|count| (sequence, count))
     }
@@ -77,7 +84,13 @@ impl EchoHandle {
     ) -> impl Stream<Item = (Sequence, i32)> + 'a {
         sequences
             .then(move |sequence| self.get_echoes(digest, sequence))
-            .filter_map(|x| async move { x })
+            .inspect(|count| match count {
+                None => error!("agent failure"),
+                Some((seq, count)) => {
+                    debug!("echo count is {} for {}", count, seq)
+                }
+            })
+            .map(|x| x.unwrap())
     }
 
     /// Register echoes for many different payloads at once
@@ -97,15 +110,11 @@ impl EchoHandle {
     }
 
     /// Register a conflicting block from  a given remote peer
-    pub async fn conflicts(
-        &self,
-        batch: Digest,
-        peer: PublicKey,
-        sequence: Sequence,
-    ) -> Option<(Sequence, i32)> {
-        self.send_command(Command::Conflict(batch, peer, sequence))
+    pub async fn conflicts(&self, batch: Digest, peer: PublicKey, sequence: Sequence) {
+        self.command
+            .send(Command::Conflict(batch, peer, sequence))
             .await
-            .map(|count| (sequence, count))
+            .ok();
     }
 
     /// Register many conflicts for different sequences for a single peer
@@ -114,27 +123,19 @@ impl EchoHandle {
         batch: Digest,
         peer: PublicKey,
         sequences: impl IntoIterator<Item = Sequence> + 'a,
-    ) -> impl Stream<Item = (Sequence, i32)> + 'a {
+    ) {
         sequences
             .into_iter()
             .map(|seq| self.conflicts(batch, peer, seq))
             .collect::<FuturesUnordered<_>>()
-            .filter_map(|x| async move { x })
+            .for_each(|_| futures::future::ready(()))
+            .await;
     }
 
     /// Purge all echo information related to the specified Digest
     pub async fn purge(&self, digest: Digest) {
-        self.send_command(Command::Purge(digest)).await;
-    }
-
-    /// Internal helper to send commands to the agent
-    async fn send_command(&self, cmd: Command) -> Option<i32> {
-        let (tx, rx) = oneshot::channel();
-
-        if self.command.send((cmd, tx)).await.is_err() {
-            None
-        } else {
-            rx.await.ok()
+        if let Err(e) = self.command.send(Command::Purge(digest)).await {
+            error!("unable to purge agent for {}: {}", digest, e);
         }
     }
 }
@@ -191,7 +192,7 @@ impl PartialOrd for EchoStatus {
 
 enum Command {
     /// Notify of new `Received` message
-    Received(Digest, PublicKey, Sequence),
+    Received(Digest, PublicKey, Sequence, oneshot::Sender<i32>),
     /// The specified payload conflicts for a remote peer
     Conflict(Digest, PublicKey, Sequence),
     /// Purge all echo information
@@ -201,12 +202,12 @@ enum Command {
 }
 
 struct EchoAgent {
-    receiver: mpsc::Receiver<(Command, oneshot::Sender<i32>)>,
+    receiver: mpsc::Receiver<Command>,
     echoes: HashMap<Digest, EchoList>,
 }
 
 impl EchoAgent {
-    fn new(receiver: mpsc::Receiver<(Command, oneshot::Sender<i32>)>) -> Self {
+    fn new(receiver: mpsc::Receiver<Command>) -> Self {
         Self {
             receiver,
             echoes: Default::default(),
@@ -224,9 +225,9 @@ impl EchoAgent {
     async fn process_loop(mut self) -> Self {
         debug!("started echo agent");
 
-        while let Some((command, tx)) = self.receiver.recv().await {
+        while let Some(command) = self.receiver.recv().await {
             match command {
-                Command::Received(hash, sender, sequence) => {
+                Command::Received(hash, sender, sequence, tx) => {
                     let entry = self.echoes.entry(hash).or_default();
                     let conflicts = entry.echo(sequence, sender);
 
@@ -248,8 +249,13 @@ impl EchoAgent {
                 Command::GetEcho(digest, sequence, resp) => {
                     trace!("getting echo count for {} of {}", sequence, digest);
                     let echoes = self.echoes.entry(digest).or_default();
+                    let count = echoes.count(sequence);
 
-                    let _ = resp.send(echoes.count(sequence));
+                    trace!("echo count for {} is {}", sequence, count);
+
+                    if resp.send(count).is_err() {
+                        error!("channel closed before response was sent");
+                    }
                 }
             }
         }
@@ -536,6 +542,34 @@ mod test {
     }
 
     #[tokio::test]
+    async fn get_many_echoes() {
+        const SIZE: usize = 10;
+
+        let handle = EchoHandle::default();
+        let batch = generate_batch(SIZE);
+        let digest = *batch.info().digest();
+        let keys = keyset(SIZE);
+
+        let seqs = 0..batch.info().sequence();
+
+        for key in keys {
+            handle
+                .send_many(digest, key, seqs.clone())
+                .await
+                .collect::<Vec<_>>()
+                .await;
+        }
+
+        handle
+            .get_many_echoes(digest, seqs)
+            .await
+            .for_each(|(_, count)| async move {
+                assert_eq!(count, SIZE as i32);
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn pack_retraction() {
         let handle = EchoHandle::default();
         let batch = generate_batch(SIZE / 5);
@@ -605,8 +639,6 @@ mod test {
 
         manager
             .many_conflicts(digest, key, 0..batch.info().sequence())
-            .await
-            .collect::<Vec<_>>()
             .await;
 
         let correct: Vec<_> = (0..batch.info().sequence()).take(SIZE / 2).collect();
