@@ -20,6 +20,7 @@ tracing-futures = "0.2"
 structopt = { version = "0.3", optional = true }
 postage = "0.4"
 derive_builder = "0.10"
+tokio-stream = "0.1"
 
 [dev-dependencies]
 drop = { git = "https://github.com/Distributed-EPFL/drop", features = [ "test" ] }
