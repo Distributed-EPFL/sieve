@@ -67,7 +67,7 @@ where
 
     /// Get the list of excluded `Sequence`s in this `FilteredBatch`
     pub fn included(&self) -> impl Iterator<Item = Sequence> + '_ {
-        (0..self.len() as Sequence).filter(move |x| !self.excluded.contains(&x))
+        (0..self.batch.info().sequence()).filter(move |x| !self.excluded.contains(&x))
     }
 
     /// Number of excluded payloads in this `FilteredBatch`
@@ -147,7 +147,7 @@ where
     M: Message,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self.batch.info())
+        write!(f, "{} excluding {:?}", self.batch.info(), self.excluded)
     }
 }
 
