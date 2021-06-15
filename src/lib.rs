@@ -16,7 +16,7 @@ use drop::system::{
     message, ConvertSender, Handle, Message, Processor, SampleError, Sampler, Sender, SenderError,
 };
 
-use futures::{stream, Stream, StreamExt};
+use futures::{future, stream, Stream, StreamExt};
 
 use murmur::*;
 pub use murmur::{Batch, BatchInfo, Fixed, Payload, RdvPolicy, RoundRobin, Sequence};
@@ -44,6 +44,9 @@ use structs::TimedBatch;
 mod utils;
 use utils::ConflictHandle;
 pub use utils::EchoHandle;
+
+mod seen;
+pub use seen::SeenHandle;
 
 /// Type of messages exchanged by the [`Sieve`] algorithm
 ///
@@ -149,6 +152,7 @@ where
     gossip: RwLock<HashSet<PublicKey>>,
     echoes: EchoHandle,
     conflicts: ConflictHandle,
+    seen: SeenHandle,
     config: SieveConfig,
 }
 
@@ -179,7 +183,8 @@ where
             handle: Default::default(),
             gossip: Default::default(),
             echoes: EchoHandle::new(config.channel_cap(), "sieve"),
-            conflicts: ConflictHandle::new(32),
+            seen: SeenHandle::new(config.channel_cap()),
+            conflicts: ConflictHandle::new(config.channel_cap()),
         }
     }
 
@@ -236,10 +241,6 @@ where
 
         self.echoes
             .many_conflicts(*info.digest(), from, sequences.iter().copied())
-            .await
-            .for_each(|(seq, count)| async move {
-                debug!("{} echoes after conflict signaling for {}", count, seq,)
-            })
             .await;
 
         echoes.filter_map(move |(seq, x)| async move {
@@ -260,46 +261,65 @@ where
     }
 
     /// Check a `Stream`  of sequences to see which ones have already been delivered
+    ///
     /// # Returns
     /// `Some` if at least one `Sequence` in the `Stream` has not been delivered yet,
     /// `None` otherwise
-    async fn deliverable(
+    async fn deliverable_unseen(
         &self,
         digest: Digest,
         sequences: impl Stream<Item = Sequence>,
     ) -> Option<FilteredBatch<M>> {
-        let mut delivered = self.delivered.write().await;
-        let delivered = delivered.entry(digest).or_default();
+        let echoes = self
+            .echoes
+            .get_many_echoes_stream(digest, sequences)
+            .await
+            .filter_map(|(seq, count)| {
+                future::ready(if self.config.threshold_cmp(count) {
+                    trace!("enough echoes for {} of {}", seq, digest);
+                    Some(seq)
+                } else {
+                    None
+                })
+            });
 
-        let not_delivered: BTreeSet<Sequence> = sequences
-            .filter(|x| {
-                let r = !delivered.contains(x);
+        let seen = self
+            .seen
+            .register_delivered(digest, echoes)
+            .await
+            .inspect(|seq| {
+                trace!("ready to deliver {} from {}", seq, digest);
+            });
 
-                async move { r }
-            })
-            .collect()
-            .await;
+        let new = seen.collect::<BTreeSet<_>>().await;
 
-        if not_delivered.is_empty() {
-            trace!("no new sequences to deliver for {}", digest);
+        debug!("new sequences are {:?}", new);
+
+        if new.is_empty() {
+            trace!("no new sequence deliverable for {}", digest);
             None
         } else {
             self.pending
                 .read()
                 .await
                 .get(&digest)
-                .map(Into::into)
-                .map(|batch| {
-                    delivered.extend(&not_delivered);
-                    debug!(
-                        "ready to deliver {} new payloads from {}",
-                        digest,
-                        not_delivered.len(),
-                    );
-
-                    FilteredBatch::with_inclusion(batch, &not_delivered)
-                })
+                .map(|batch| batch.into())
+                .map(|batch: FilteredBatch<M>| batch.include(new))
         }
+    }
+
+    async fn deliverable_seen(
+        &self,
+        digest: Digest,
+        sequences: impl IntoIterator<Item = Sequence>,
+    ) -> Option<FilteredBatch<M>> {
+        let newly_seen = self
+            .seen
+            .register_seen(digest, stream::iter(sequences))
+            .await
+            .inspect(|seq| trace!("newly seen sequence {} from {}", seq, digest));
+
+        self.deliverable_unseen(digest, newly_seen).await
     }
 
     async fn deliver(&self, batch: FilteredBatch<M>) -> Result<(), SieveError> {
@@ -346,7 +366,7 @@ where
 
                 let echoes = self.process_exceptions(info, from, sequences).await;
 
-                if let Some(batch) = self.deliverable(*info.digest(), echoes).await {
+                if let Some(batch) = self.deliverable_unseen(*info.digest(), echoes).await {
                     self.deliver(batch).await?;
                 }
             }
@@ -361,7 +381,7 @@ where
                         );
 
                         if let Some(batch) = self
-                            .deliverable(*digest, stream::once(async move { seq }))
+                            .deliverable_unseen(*digest, stream::once(async move { seq }))
                             .await
                         {
                             debug!("ready to deliver payload {} from {}", sequence, digest);
@@ -395,15 +415,15 @@ where
                     let digest = *batch.info().digest();
 
                     if let Some(ack) = self.register_batch(batch).await? {
+                        debug!("acknowledging new batch {} to subscribers", digest);
+
                         sender
                             .send_many(ack, self.gossip.read().await.iter())
                             .await
                             .context(Network)?;
                     }
 
-                    let sequences = 0..size;
-
-                    if let Some(batch) = self.deliverable(digest, stream::iter(sequences)).await {
+                    if let Some(batch) = self.deliverable_seen(digest, 0..size).await {
                         self.deliver(batch).await?;
                     }
                 }
@@ -778,11 +798,13 @@ pub mod test {
             let mut manager = DummyManager::new(messages, SIZE);
             let mut handle = manager.run(sieve).await;
 
-            let b1 = handle.deliver().await.expect("failed deliver");
-            let b2 = handle.deliver().await.expect("failed deliver");
+            let mut len = 0;
 
-            assert_eq!(b1.len(), 5);
-            assert_eq!(b2.len(), 1);
+            while let Ok(b) = handle.deliver().await {
+                len += b.len();
+            }
+
+            assert_eq!(len, 6, "wrong number of payload delivered");
         }
 
         #[tokio::test]
