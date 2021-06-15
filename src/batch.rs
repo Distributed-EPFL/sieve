@@ -2,6 +2,7 @@ use super::*;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::iter;
 
 /// A view of a `Batch` that  filters out `Payload`s that haven't received sufficient echoes
 /// from other peers
@@ -105,7 +106,7 @@ where
 
         Self::new(
             self.batch.clone(),
-            self.excluded.iter().filter(|x| !new.contains(x)).copied(),
+            (0..self.sequence()).filter(|x| !new.contains(x)),
         )
     }
 
@@ -147,5 +148,14 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self.batch.info())
+    }
+}
+
+impl<M> From<&TimedBatch<M>> for FilteredBatch<M>
+where
+    M: Message,
+{
+    fn from(batch: &TimedBatch<M>) -> Self {
+        Self::new(batch.into(), iter::empty())
     }
 }
