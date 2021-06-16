@@ -60,6 +60,10 @@ where
     Ack(Digest, Sequence),
     /// Acknowledge all payloads in a batch with a list of exceptions
     ValidExcept(BatchInfo, Vec<Sequence>),
+
+    /// Remote request that we update them of our changes
+    Subscribe,
+
     #[serde(bound(deserialize = "M: Message"))]
     /// Encapsulated [`Murmur`] message
     ///
@@ -150,6 +154,7 @@ where
     delivered: RwLock<HashMap<Digest, BTreeSet<Sequence>>>,
     delivery: Option<dispatch::Sender<FilteredBatch<M>>>,
     gossip: RwLock<HashSet<PublicKey>>,
+    subscribers: RwLock<HashSet<PublicKey>>,
     echoes: EchoHandle,
     conflicts: ConflictHandle,
     seen: SeenHandle,
@@ -182,6 +187,7 @@ where
             delivered: Default::default(),
             handle: Default::default(),
             gossip: Default::default(),
+            subscribers: Default::default(),
             echoes: EchoHandle::new(config.channel_cap(), "sieve"),
             seen: SeenHandle::new(config.channel_cap()),
             conflicts: ConflictHandle::new(config.channel_cap()),
@@ -391,6 +397,21 @@ where
                     }
                 }
             }
+            SieveMessage::Subscribe if self.subscribers.write().await.insert(from) => {
+                let batches = self.pending.read().await;
+
+                let echoes = stream::iter(batches.values()).filter_map(|batch| async move {
+                    let info = *batch.info();
+                    let exclusion = self.seen.get_exclusions(&info).await?;
+
+                    SieveMessage::ValidExcept(info, exclusion).into()
+                });
+
+                sender
+                    .send_many_to_one_stream(echoes, &from)
+                    .await
+                    .context(Network)?;
+            }
             SieveMessage::Murmur(murmur) => {
                 let msender = Arc::new(ConvertSender::new(sender.clone()));
 
@@ -409,7 +430,7 @@ where
                     .await;
 
                 if let Ok(Some(batch)) = delivery {
-                    debug!("delivered a new batch via murmur");
+                    debug!("delivered a new batch via murmur {:?}", batch.info());
 
                     let size = batch.info().sequence();
                     let digest = *batch.info().digest();
@@ -418,7 +439,7 @@ where
                         debug!("acknowledging new batch {} to subscribers", digest);
 
                         sender
-                            .send_many(ack, self.gossip.read().await.iter())
+                            .send_many(ack, self.subscribers.read().await.iter())
                             .await
                             .context(Network)?;
                     }
@@ -428,6 +449,8 @@ where
                     }
                 }
             }
+
+            e => debug!("ignored {:?} from {}", e, from),
         }
 
         Ok(())
@@ -444,6 +467,11 @@ where
             )
             .await
             .expect("unable to collect sample");
+
+        sender
+            .send_many(SieveMessage::Subscribe, sample.iter())
+            .await
+            .expect("subscription failed");
 
         self.gossip.write().await.extend(sample);
 
@@ -466,6 +494,8 @@ where
             let mut gossip = self.gossip.write().await;
 
             gossip.remove(&peer);
+
+            self.subscribers.write().await.remove(&peer);
 
             let not_gossip = sender
                 .keys()
@@ -689,9 +719,9 @@ pub mod test {
 
             const SIZE: usize = 10;
             const CONFLICT_RANGE: std::ops::Range<Sequence> =
-                (SIZE as Sequence / 2)..(SIZE as Sequence);
+                (SIZE * SIZE / 2) as Sequence..(SIZE * SIZE) as Sequence;
 
-            let batch = generate_batch(SIZE);
+            let batch = generate_batch(SIZE, SIZE);
             let messages = generate_sieve_sequence(SIZE, batch.clone(), CONFLICT_RANGE);
             let mut manager = DummyManager::new(messages, SIZE);
             let sieve = Sieve::default();
@@ -705,7 +735,11 @@ pub mod test {
                 CONFLICT_RANGE.count(),
                 "wrong number of conflicts"
             );
-            assert_eq!(filtered.len(), SIZE / 2, "wrong number of correct delivery");
+            assert_eq!(
+                filtered.len(),
+                CONFLICT_RANGE.count(),
+                "wrong number of correct delivery"
+            );
 
             batch
                 .into_iter()
@@ -720,6 +754,7 @@ pub mod test {
         async fn reports_conflicts() {
             use drop::test::DummyManager;
 
+            const PEER_COUNT: usize = 10;
             const RANGE: std::ops::Range<usize> = 5..8;
 
             drop::test::init_logger();
@@ -748,13 +783,15 @@ pub mod test {
 
             assert_eq!(batches.len(), RANGE.count());
 
+            let subscriptions = iter::repeat(SieveMessage::Subscribe).take(PEER_COUNT);
+
             let messages = batches.iter().cloned().flat_map(|batch| {
                 iter::once(MurmurMessage::Announce(*batch.info(), true))
                     .chain(generate_transmit(batch))
                     .map(Into::into)
             });
 
-            let mut manager = DummyManager::new(messages, 10);
+            let mut manager = DummyManager::new(subscriptions.chain(messages), PEER_COUNT);
 
             manager.run(sieve).await;
 
@@ -788,7 +825,8 @@ pub mod test {
             const CONFLICT_RANGE: std::ops::Range<Sequence> = CONFLICT..(SIZE as Sequence);
             const CONFLICT: Sequence = 5;
 
-            let batch = generate_batch(SIZE);
+            let batch = generate_batch(SIZE, SIZE);
+            let count = batch.len();
             let info = *batch.info();
 
             let messages = generate_sieve_sequence(SIZE, batch, CONFLICT_RANGE)
@@ -801,10 +839,12 @@ pub mod test {
             let mut len = 0;
 
             while let Ok(b) = handle.deliver().await {
-                len += b.len();
+                len += b.len() as Sequence;
             }
 
-            assert_eq!(len, 6, "wrong number of payload delivered");
+            let expected = count - CONFLICT + 1;
+
+            assert_eq!(len, expected, "wrong number of payload delivered");
         }
 
         #[tokio::test]
@@ -813,7 +853,7 @@ pub mod test {
 
             const SIZE: usize = 10;
 
-            let batch = generate_batch(SIZE);
+            let batch = generate_batch(SIZE, 1);
 
             let messages = generate_sieve_sequence(SIZE, batch.clone(), iter::empty());
             let mut manager = DummyManager::new(messages, SIZE);
@@ -839,8 +879,9 @@ pub mod test {
             drop::test::init_logger();
 
             const SIZE: usize = 10;
+            const PAYLOAD_COUNT: usize = SIZE;
 
-            let batch = generate_batch(SIZE);
+            let batch = generate_batch(SIZE, 1);
 
             let messages = generate_sieve_sequence(SIZE, batch, iter::empty());
 
@@ -856,10 +897,10 @@ pub mod test {
 
             seqs.sort_unstable();
 
-            assert_eq!(seqs.len(), SIZE, "wrong delivery count");
+            assert_eq!(seqs.len(), PAYLOAD_COUNT, "wrong delivery count");
             assert_eq!(
                 seqs,
-                (0..SIZE as Sequence).collect::<Vec<_>>(),
+                (0..PAYLOAD_COUNT as Sequence).collect::<Vec<_>>(),
                 "incorrect sequence delivery"
             );
         }
@@ -919,11 +960,12 @@ pub mod test {
         async fn garbage_collection_helper(
             delay: u64,
         ) -> Sieve<u32, drop::system::CollectingSender<SieveMessage<u32>>, Fixed> {
+            const SIZE: usize = 10;
             let mut config = SieveConfig::default();
             config.murmur.batch_expiration = delay;
 
             let sieve = Sieve::new(Fixed::new_local(), config);
-            let batch = Arc::new(generate_batch(10));
+            let batch = Arc::new(generate_batch(SIZE, SIZE));
 
             sieve
                 .register_batch(batch)
