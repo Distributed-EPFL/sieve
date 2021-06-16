@@ -427,7 +427,7 @@ mod test {
         drop::test::init_logger();
 
         let manager = EchoHandle::default();
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
         let hash = *batch.info().digest();
         let public = *KeyPair::random().public();
 
@@ -451,7 +451,7 @@ mod test {
         drop::test::init_logger();
 
         let manager = EchoHandle::default();
-        let batch = generate_batch(1);
+        let batch = generate_batch(1, SIZE);
         let digest = *batch.info().digest();
         let sequence = 0;
 
@@ -469,7 +469,7 @@ mod test {
     #[tokio::test]
     async fn no_conflict() {
         let manager = ConflictHandle::default();
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
 
         for payload in batch.iter() {
             let digest = hash(payload).expect("hash failed");
@@ -518,7 +518,7 @@ mod test {
         const SIZE: usize = 10;
 
         let handle = EchoHandle::default();
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
         let keys: Vec<_> = keyset(SIZE).collect();
 
@@ -546,7 +546,7 @@ mod test {
         const SIZE: usize = 10;
 
         let handle = EchoHandle::default();
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
         let keys = keyset(SIZE);
 
@@ -572,7 +572,7 @@ mod test {
     #[tokio::test]
     async fn pack_retraction() {
         let handle = EchoHandle::default();
-        let batch = generate_batch(SIZE / 5);
+        let batch = generate_batch(SIZE, 1);
         let digest = *batch.info().digest();
         let keys: Vec<_> = keyset(SIZE).collect();
 
@@ -606,7 +606,7 @@ mod test {
         use futures::future;
 
         let manager = EchoHandle::default();
-        let batch = generate_batch(1);
+        let batch = generate_batch(1, SIZE);
 
         let echoes = keyset(SIZE / 2);
         let conflicts = keyset(SIZE / 2);
@@ -633,7 +633,7 @@ mod test {
     #[tokio::test]
     async fn state_switch() {
         let manager = EchoHandle::default();
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
         let key = keyset(1).next().unwrap();
 

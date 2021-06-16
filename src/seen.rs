@@ -1,7 +1,8 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
+use std::pin::Pin;
 
-use super::{Digest, Sequence};
+use super::{BatchInfo, Digest, Sequence};
 
 use futures::future::FutureExt;
 use futures::stream::{self, Stream, StreamExt};
@@ -97,6 +98,35 @@ impl SeenHandle {
     ) -> impl Stream<Item = Sequence> {
         self.register_delivered(digest, stream::iter(seqs.into_iter()))
             .await
+    }
+
+    /// Get the list of sequences we haven't yet from the specified batch
+    pub async fn get_exclusions(&self, info: &BatchInfo) -> Option<Vec<Sequence>> {
+        if let Some(seen) = self.get_seen(*info.digest()).await {
+            let range = 0..info.sequence();
+            let mut peek = seen.peekable();
+            let mut excluded = Vec::new();
+
+            debug!(
+                "collection exclusion list for {} of size {}",
+                info.digest(),
+                info.sequence()
+            );
+
+            for i in range {
+                let pinned = Pin::new(&mut peek);
+
+                if pinned.next_if_eq(&i).await.is_some() {
+                    continue;
+                } else {
+                    excluded.push(i);
+                }
+            }
+
+            excluded.into()
+        } else {
+            None
+        }
     }
 
     /// Get all seen or delivered sequences from the specified batch
@@ -251,7 +281,7 @@ mod test {
 
     #[tokio::test]
     async fn purging() {
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
         let handle = SeenHandle::new(32);
 
@@ -273,7 +303,7 @@ mod test {
 
     #[tokio::test]
     async fn seen() {
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
         let handle = SeenHandle::new(32);
         let seen = stream::iter((0..batch.len()).step_by(2));
@@ -300,7 +330,7 @@ mod test {
 
     #[tokio::test]
     async fn seen_then_delivered() {
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
         let handle = SeenHandle::new(32);
         let range = 0..batch.len();
@@ -334,7 +364,7 @@ mod test {
 
     #[tokio::test]
     async fn delivered_then_seen() {
-        let batch = generate_batch(SIZE);
+        let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
         let handle = SeenHandle::new(32);
         let range = 0..batch.len();
@@ -355,5 +385,26 @@ mod test {
                 assert_eq!(exp as Sequence, actual);
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn exclusions() {
+        drop::test::init_logger();
+
+        let batch = generate_batch(SIZE, SIZE);
+        let digest = *batch.info().digest();
+        let handle = SeenHandle::new(32);
+        let conflicts = (0..batch.len()).step_by(2).collect::<Vec<_>>();
+        let correct = (0..batch.len()).skip(1).step_by(2);
+
+        handle
+            .register_seen(digest, stream::iter(correct))
+            .await
+            .for_each(|_| future::ready(()))
+            .await;
+
+        let exclusions = handle.get_exclusions(batch.info()).await.unwrap();
+
+        assert_eq!(exclusions, conflicts);
     }
 }
