@@ -330,6 +330,8 @@ where
     }
 
     async fn deliver(&self, batch: FilteredBatch<M>) -> Result<(), SieveError> {
+        debug_assert!(!batch.is_empty(), "attempted to deliver empty batch");
+
         debug!(
             "delivering {} payloads from batch {}",
             batch.len(),
@@ -832,29 +834,31 @@ pub mod test {
             drop::test::init_logger();
 
             const SIZE: usize = 10;
-            const CONFLICT_RANGE: std::ops::Range<Sequence> = CONFLICT..(SIZE as Sequence);
-            const CONFLICT: Sequence = 5;
+            const TOTAL: usize = SIZE * SIZE;
+            const LATE: Sequence = 95;
+
 
             let batch = generate_batch(SIZE, SIZE);
-            let count = batch.len();
             let info = *batch.info();
 
-            let messages = generate_sieve_sequence(SIZE, batch, CONFLICT_RANGE)
-                .chain(generate_single_ack(info, SIZE, CONFLICT));
+            let messages = generate_sieve_sequence(SIZE, batch.clone(), 0..TOTAL as Sequence)
+                .chain(generate_single_ack(info, SIZE, LATE));
 
             let sieve = Sieve::default();
             let mut manager = DummyManager::new(messages, SIZE);
             let mut handle = manager.run(sieve).await;
 
-            let mut len = 0;
+            let mut delivered = FilteredBatch::empty(Arc::new(batch.clone()));
 
             while let Ok(b) = handle.deliver().await {
-                len += b.len() as Sequence;
+                delivered.merge(b);
             }
 
-            let expected = count - CONFLICT + 1;
+            println!("{:?}", delivered);
 
-            assert_eq!(len, expected, "wrong number of payload delivered");
+            assert_eq!(delivered.len(), 1, "wrong number of payload delivered");
+            assert_eq!(delivered.excluded_len(), TOTAL - 1);
+            assert_eq!(delivered.iter().next().unwrap(), &batch[LATE]);
         }
 
         #[tokio::test]
@@ -877,6 +881,7 @@ pub mod test {
 
             assert_eq!(filtered.excluded_len(), 0, "wrong number of conflict");
             assert_eq!(filtered.len(), SIZE * BLOCK_SIZE);
+            assert_eq!(filtered.iter().count(), SIZE * BLOCK_SIZE);
 
             batch
                 .into_iter()
