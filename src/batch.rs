@@ -26,6 +26,20 @@ where
         Self { batch, excluded }
     }
 
+    /// Create a new `FilteredBatch` that excludes all `Sequence`s
+    pub fn empty(batch: Arc<Batch<M>>) -> Self {
+        let excluded = (0..batch.info().sequence()).collect();
+
+        Self { batch, excluded }
+    }
+
+    /// Create a new `FilteredBatch` that includes all `Sequence`s
+    pub fn full(batch: Arc<Batch<M>>) -> Self {
+        let excluded = iter::empty().collect();
+
+        Self { batch, excluded }
+    }
+
     /// Create new `FilteredBatch` from a list of included sequences
     pub fn with_inclusion(batch: Arc<Batch<M>>, include: &BTreeSet<Sequence>) -> Self {
         let excluded = (0..batch.info().sequence())
@@ -77,7 +91,7 @@ where
 
     /// Get the total length of this `FilteredBatch` as a `Sequence`
     pub fn sequence(&self) -> Sequence {
-        self.batch.info().sequence()
+        self.len() as Sequence
     }
 
     /// Merge the given `FilteredBatch` with this one
@@ -124,7 +138,14 @@ where
     pub fn iter(&self) -> impl Iterator<Item = &Payload<M>> {
         self.batch
             .iter()
-            .filter(move |x| !self.excluded.contains(&x.sequence()))
+            .enumerate()
+            .filter_map(move |(x, payload)| {
+                if self.excluded.contains(&(x as Sequence)) {
+                    None
+                } else {
+                    Some(payload)
+                }
+            })
     }
 }
 
@@ -157,5 +178,40 @@ where
 {
     fn from(batch: &TimedBatch<M>) -> Self {
         Self::new(batch.into(), iter::empty())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use murmur::test::generate_batch;
+
+    const SIZE: usize = 10;
+    const PAYLOAD_COUNT: usize = SIZE * SIZE;
+    const HALF: Sequence = PAYLOAD_COUNT as Sequence / 2;
+
+    #[test]
+    fn batch_merging() {
+        let batch = Arc::new(generate_batch(SIZE, SIZE));
+        let mut one = FilteredBatch::full(batch.clone());
+        let excluded = FilteredBatch::new(batch, 0..(SIZE * SIZE) as Sequence);
+
+        one.merge(excluded);
+
+        assert_eq!(one.len(), SIZE * SIZE);
+        assert_eq!(one.iter().count(), SIZE * SIZE);
+    }
+
+    #[test]
+    fn half_batch_merging() {
+        let batch = Arc::new(generate_batch(SIZE, SIZE));
+
+        let mut first = FilteredBatch::new(batch.clone(), 0..(HALF));
+        let second = FilteredBatch::new(batch, HALF..PAYLOAD_COUNT as Sequence);
+
+        first.merge(second);
+
+        assert_eq!(first.len(), PAYLOAD_COUNT);
+        assert_eq!(first.iter().count(), PAYLOAD_COUNT);
     }
 }
