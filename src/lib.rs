@@ -266,7 +266,7 @@ where
         })
     }
 
-    /// Check a `Stream`  of sequences to see which ones have already been delivered
+    /// Check a `Stream`  of sequences to see which ones can be delivered
     ///
     /// # Returns
     /// `Some` if at least one `Sequence` in the `Stream` has not been delivered yet,
@@ -279,7 +279,6 @@ where
         let echoes = self
             .echoes
             .get_many_echoes_stream(digest, sequences)
-            .await
             .filter_map(|(seq, count)| {
                 future::ready(if self.config.threshold_cmp(count) {
                     trace!("enough echoes for {} of {}", seq, digest);
@@ -288,6 +287,8 @@ where
                     None
                 })
             });
+
+        let echoes = stream::iter(echoes.collect::<Vec<_>>().await);
 
         let seen = self
             .seen
@@ -377,23 +378,22 @@ where
                 }
             }
             SieveMessage::Ack(ref digest, ref sequence) => {
-                if let Some((seq, echoes)) = self.echoes.send(*digest, from, *sequence).await {
-                    debug!("now have {} p-acks for {} of {}", echoes, seq, digest);
+                let (seq, echoes) = self.echoes.send(*digest, from, *sequence).await;
+                debug!("now have {} p-acks for {} of {}", echoes, seq, digest);
 
-                    if self.config.threshold_cmp(echoes) {
-                        debug!(
-                            "reached threshold for payload {} of batch {}",
-                            sequence, digest
-                        );
+                if self.config.threshold_cmp(echoes) {
+                    debug!(
+                        "reached threshold for payload {} of batch {}",
+                        sequence, digest
+                    );
 
-                        if let Some(batch) = self
-                            .deliverable_unseen(*digest, stream::once(async move { seq }))
-                            .await
-                        {
-                            debug!("ready to deliver payload {} from {}", sequence, digest);
+                    if let Some(batch) = self
+                        .deliverable_unseen(*digest, stream::once(async move { seq }))
+                        .await
+                    {
+                        debug!("ready to deliver payload {} from {}", sequence, digest);
 
-                            self.deliver(batch).await?;
-                        }
+                        self.deliver(batch).await?;
                     }
                 }
             }
@@ -436,15 +436,21 @@ where
                     let digest = *batch.info().digest();
 
                     if let Some(ack) = self.register_batch(batch).await? {
-                        debug!("acknowledging new batch {} to subscribers", digest);
+                        debug!("echoing new batch {} from murmur to subscribers", digest);
 
                         sender
                             .send_many(ack, self.subscribers.read().await.iter())
                             .await
                             .context(Network)?;
+
+                        debug!("done echoing batch {}", digest);
                     }
 
-                    if let Some(batch) = self.deliverable_seen(digest, 0..size).await {
+                    let sequences = (0..size).inspect(move |seq| {
+                        debug!("registering {}/{} from {} as seen", seq, size, digest)
+                    });
+
+                    if let Some(batch) = self.deliverable_seen(digest, sequences).await {
                         self.deliver(batch).await?;
                     }
                 }
@@ -721,32 +727,36 @@ pub mod test {
             const CONFLICT_RANGE: std::ops::Range<Sequence> =
                 (SIZE * SIZE / 2) as Sequence..(SIZE * SIZE) as Sequence;
 
-            let batch = generate_batch(SIZE, SIZE);
-            let messages = generate_sieve_sequence(SIZE, batch.clone(), CONFLICT_RANGE);
+            let batch = Arc::new(generate_batch(SIZE, SIZE));
+            let messages = generate_sieve_sequence(SIZE, (&*batch).clone(), CONFLICT_RANGE);
             let mut manager = DummyManager::new(messages, SIZE);
             let sieve = Sieve::default();
 
             let mut handle = manager.run(sieve).await;
 
-            let filtered = handle.deliver().await.expect("no delivery");
+            let mut empty = FilteredBatch::new(batch.clone(), 0..batch.info().sequence());
+
+            while let Ok(filtered) = handle.deliver().await {
+                empty.merge(filtered);
+            }
 
             assert_eq!(
-                filtered.excluded_len(),
+                empty.excluded_len(),
                 CONFLICT_RANGE.count(),
                 "wrong number of conflicts"
             );
             assert_eq!(
-                filtered.len(),
+                empty.len(),
                 CONFLICT_RANGE.count(),
                 "wrong number of correct delivery"
             );
 
             batch
-                .into_iter()
+                .iter()
                 .take(CONFLICT_RANGE.count())
-                .zip(filtered.iter())
+                .zip(empty.iter())
                 .for_each(|(expected, actual)| {
-                    assert_eq!(&expected, actual, "bad payload");
+                    assert_eq!(expected, actual, "bad payload");
                 });
         }
 
@@ -851,9 +861,10 @@ pub mod test {
         async fn deliver_no_conflict() {
             drop::test::init_logger();
 
+            const BLOCK_SIZE: usize = 100;
             const SIZE: usize = 10;
 
-            let batch = generate_batch(SIZE, 1);
+            let batch = generate_batch(SIZE, BLOCK_SIZE);
 
             let messages = generate_sieve_sequence(SIZE, batch.clone(), iter::empty());
             let mut manager = DummyManager::new(messages, SIZE);
@@ -865,6 +876,7 @@ pub mod test {
             let filtered = handle.deliver().await.expect("no delivery");
 
             assert_eq!(filtered.excluded_len(), 0, "wrong number of conflict");
+            assert_eq!(filtered.len(), SIZE * BLOCK_SIZE);
 
             batch
                 .into_iter()
@@ -879,9 +891,10 @@ pub mod test {
             drop::test::init_logger();
 
             const SIZE: usize = 10;
-            const PAYLOAD_COUNT: usize = SIZE;
+            const BLOCK_SIZE: usize = 100;
+            const PAYLOAD_COUNT: usize = SIZE * BLOCK_SIZE;
 
-            let batch = generate_batch(SIZE, 1);
+            let batch = generate_batch(SIZE, BLOCK_SIZE);
 
             let messages = generate_sieve_sequence(SIZE, batch, iter::empty());
 

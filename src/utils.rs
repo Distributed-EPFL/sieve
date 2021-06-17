@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use drop::crypto::key::exchange::PublicKey;
 use drop::crypto::Digest;
 
-use futures::stream::{FuturesUnordered, Stream, StreamExt};
+use futures::stream::{Stream, StreamExt};
 
 use murmur::Sequence;
 
@@ -36,36 +36,53 @@ impl EchoHandle {
     }
 
     /// Send a `Payload` for conflict validation.
-    pub async fn send(
-        &self,
-        batch: Digest,
-        sender: PublicKey,
-        seq: Sequence,
-    ) -> Option<(Sequence, i32)> {
+    pub async fn send(&self, batch: Digest, sender: PublicKey, seq: Sequence) -> (Sequence, i32) {
         let (tx, rx) = oneshot::channel();
 
-        self.command
+        if self
+            .command
             .send(Command::Received(batch, sender, seq, tx))
             .await
-            .ok()?;
+            .is_err()
+        {
+            error!("echo agent not running");
 
-        rx.await.ok().map(|echoes| (seq, echoes))
+            (seq, 0)
+        } else {
+            rx.await.map(|echoes| (seq, echoes)).unwrap_or((seq, 0))
+        }
     }
 
     /// Get echo count for the given sequences
-    pub async fn get_echoes(&self, digest: Digest, sequence: Sequence) -> Option<(Sequence, i32)> {
+    pub async fn get_echoes(&self, digest: Digest, sequence: Sequence) -> (Sequence, i32) {
         let (tx, rx) = oneshot::channel();
 
-        self.command
+        debug!("getting echo count for {} of {}", sequence, digest);
+
+        trace!("channel buffer available is {}", self.command.capacity());
+
+        if self
+            .command
             .send(Command::GetEcho(digest, sequence, tx))
             .await
-            .ok()?;
+            .is_err()
+        {
+            error!("echo agent not running");
+            (sequence, 0)
+        } else {
+            trace!("waiting for answer from agent");
 
-        rx.await.ok().map(|count| (sequence, count))
+            rx.await
+                .map(|count| {
+                    debug!("{} from {} has {} echoes", sequence, digest, count);
+                    (sequence, count)
+                })
+                .unwrap_or((sequence, 0))
+        }
     }
 
     /// Get echo statuses for many different sequences in a batch
-    pub async fn get_many_echoes<'a>(
+    pub fn get_many_echoes<'a>(
         &'a self,
         digest: Digest,
         sequences: impl Iterator<Item = Sequence> + 'a,
@@ -73,24 +90,15 @@ impl EchoHandle {
         debug!("getting many echoes for {}", digest);
 
         self.get_many_echoes_stream(digest, stream::iter(sequences))
-            .await
     }
 
     /// Get the echo count for many sequences from a `Stream`
-    pub async fn get_many_echoes_stream<'a>(
+    pub fn get_many_echoes_stream<'a>(
         &'a self,
         digest: Digest,
         sequences: impl Stream<Item = Sequence> + 'a,
     ) -> impl Stream<Item = (Sequence, i32)> + 'a {
-        sequences
-            .then(move |sequence| self.get_echoes(digest, sequence))
-            .inspect(|count| match count {
-                None => error!("agent failure"),
-                Some((seq, count)) => {
-                    debug!("echo count is {} for {}", count, seq)
-                }
-            })
-            .map(|x| x.unwrap())
+        sequences.then(move |sequence| self.get_echoes(digest, sequence))
     }
 
     /// Register echoes for many different payloads at once
@@ -102,11 +110,7 @@ impl EchoHandle {
     ) -> impl Stream<Item = (Sequence, i32)> + 'a {
         debug!("registering new echoes from {} for {}", from, batch);
 
-        checks
-            .into_iter()
-            .map(|seq| self.send(batch, from, seq))
-            .collect::<FuturesUnordered<_>>()
-            .filter_map(|x| async move { x })
+        stream::iter(checks).then(move |seq| self.send(batch, from, seq))
     }
 
     /// Register a conflicting block from  a given remote peer
@@ -124,10 +128,8 @@ impl EchoHandle {
         peer: PublicKey,
         sequences: impl IntoIterator<Item = Sequence> + 'a,
     ) {
-        sequences
-            .into_iter()
-            .map(|seq| self.conflicts(batch, peer, seq))
-            .collect::<FuturesUnordered<_>>()
+        stream::iter(sequences)
+            .then(|seq| self.conflicts(batch, peer, seq))
             .for_each(|_| futures::future::ready(()))
             .await;
     }
@@ -190,6 +192,7 @@ impl PartialOrd for EchoStatus {
     }
 }
 
+#[derive(Debug)]
 enum Command {
     /// Notify of new `Received` message
     Received(Digest, PublicKey, Sequence, oneshot::Sender<i32>),
@@ -214,15 +217,15 @@ impl EchoAgent {
         }
     }
 
-    fn spawn(self, name: &str) -> JoinHandle<Self> {
+    fn spawn(self, name: &str) {
         task::spawn(
             self.process_loop()
                 .instrument(trace_span!("echo_agent", name=%name)),
-        )
+        );
     }
 
     /// Start the processing loop for this `ConflictManager`
-    async fn process_loop(mut self) -> Self {
+    async fn process_loop(mut self) {
         debug!("started echo agent");
 
         while let Some(command) = self.receiver.recv().await {
@@ -234,8 +237,7 @@ impl EchoAgent {
                     trace!("updating echo count for {} of {}", sequence, hash);
 
                     if tx.send(conflicts).is_err() {
-                        error!("agent controller has died");
-                        return self;
+                        warn!("response dropped by requester");
                     }
                 }
                 Command::Conflict(hash, sender, sequence) => {
@@ -261,8 +263,6 @@ impl EchoAgent {
         }
 
         debug!("echo agent exiting");
-
-        self
     }
 }
 
@@ -435,11 +435,7 @@ mod test {
             debug!("inserting payload {} into conflict holder", seq);
 
             assert_eq!(
-                manager
-                    .send(hash, public, seq as Sequence)
-                    .await
-                    .expect("issue checking conflict")
-                    .1,
+                manager.send(hash, public, seq as Sequence).await.1,
                 1,
                 "wrong ack count"
             );
@@ -460,7 +456,7 @@ mod test {
         for (count, key) in keys.enumerate() {
             assert_eq!(
                 manager.send(digest, key, sequence).await,
-                Some((sequence, count as i32 + 1)),
+                (sequence, count as i32 + 1),
                 "incorrect echo number"
             );
         }
@@ -536,7 +532,6 @@ mod test {
 
         handle
             .get_many_echoes(digest, sequences)
-            .await
             .for_each(|(_, count)| async move { assert_eq!(count, SIZE as i32) })
             .await;
     }
@@ -562,7 +557,6 @@ mod test {
 
         handle
             .get_many_echoes(digest, seqs)
-            .await
             .for_each(|(_, count)| async move {
                 assert_eq!(count, SIZE as i32);
             })
@@ -578,20 +572,14 @@ mod test {
 
         for payload in batch.iter() {
             for key in keys.iter().copied() {
-                handle
-                    .send(digest, key, payload.sequence())
-                    .await
-                    .expect("agent failed");
+                handle.send(digest, key, payload.sequence()).await;
                 handle.conflicts(digest, key, payload.sequence()).await;
             }
         }
 
         for payload in batch.iter() {
             for key in keys.iter().copied() {
-                let (_, echoes) = handle
-                    .send(digest, key, payload.sequence())
-                    .await
-                    .expect("oops");
+                let (_, echoes) = handle.send(digest, key, payload.sequence()).await;
 
                 assert_eq!(
                     SIZE as i32, echoes,
@@ -623,7 +611,6 @@ mod test {
                 .await
                 .last()
                 .map(Clone::clone)
-                .flatten()
                 .unwrap();
 
         assert_eq!(seq, 0, "wrong sequence number");
