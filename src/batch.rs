@@ -120,7 +120,7 @@ where
 
         Self::new(
             self.batch.clone(),
-            (0..self.sequence()).filter(|x| !new.contains(x)),
+            (0..self.info().sequence()).filter(|x| !new.contains(x)),
         )
     }
 
