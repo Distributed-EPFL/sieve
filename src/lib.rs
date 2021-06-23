@@ -189,7 +189,7 @@ where
             gossip: Default::default(),
             subscribers: Default::default(),
             echoes: EchoHandle::new(config.channel_cap(), "sieve"),
-            seen: SeenHandle::new(config.channel_cap()),
+            seen: SeenHandle::new(config.channel_cap(), "sieve"),
             conflicts: ConflictHandle::new(config.channel_cap()),
         }
     }
@@ -836,7 +836,6 @@ pub mod test {
             const SIZE: usize = 10;
             const TOTAL: usize = SIZE * SIZE;
             const LATE: Sequence = 95;
-
 
             let batch = generate_batch(SIZE, SIZE);
             let info = *batch.info();

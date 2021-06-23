@@ -38,14 +38,16 @@ type Channel = oneshot::Sender<Sequence>;
 pub struct SeenHandle {
     senders: RwLock<HashMap<Digest, mpsc::Sender<Command>>>,
     capacity: usize,
+    name: String,
 }
 
 impl SeenHandle {
     /// Create a new `PendingHandle` using a given channel capacity
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, name: &str) -> Self {
         Self {
             senders: Default::default(),
             capacity,
+            name: name.to_string(),
         }
     }
 
@@ -189,7 +191,7 @@ impl SeenHandle {
             .or_insert_with(|| {
                 let (tx, rx) = mpsc::channel(self.capacity);
 
-                PendingAgent::new(rx).spawn(digest);
+                PendingAgent::new(rx).spawn(digest, self.name.clone());
 
                 tx
             })
@@ -213,7 +215,7 @@ impl PendingAgent {
         }
     }
 
-    fn spawn(mut self, digest: Digest) -> JoinHandle<Self> {
+    fn spawn(mut self, digest: Digest, name: String) -> JoinHandle<Self> {
         task::spawn(
             async move {
                 debug!("started agent");
@@ -257,7 +259,7 @@ impl PendingAgent {
 
                 self
             }
-            .instrument(debug_span!("seen_manager", batch = %digest)),
+            .instrument(debug_span!("seen_manager", batch = %digest, name = %name)),
         )
     }
 }
@@ -283,7 +285,7 @@ mod test {
     async fn purging() {
         let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
-        let handle = SeenHandle::new(32);
+        let handle = SeenHandle::new(32, "test");
 
         handle
             .register_seen(digest, stream::iter(0..batch.len()))
@@ -305,7 +307,7 @@ mod test {
     async fn seen() {
         let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
-        let handle = SeenHandle::new(32);
+        let handle = SeenHandle::new(32, "test");
         let seen = stream::iter((0..batch.len()).step_by(2));
 
         handle
@@ -332,7 +334,7 @@ mod test {
     async fn seen_then_delivered() {
         let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
-        let handle = SeenHandle::new(32);
+        let handle = SeenHandle::new(32, "test");
         let range = 0..batch.len();
 
         handle
@@ -366,7 +368,7 @@ mod test {
     async fn delivered_then_seen() {
         let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
-        let handle = SeenHandle::new(32);
+        let handle = SeenHandle::new(32, "test");
         let range = 0..batch.len();
 
         let delivered = handle
@@ -393,7 +395,7 @@ mod test {
 
         let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
-        let handle = SeenHandle::new(32);
+        let handle = SeenHandle::new(32, "test");
         let conflicts = (0..batch.len()).step_by(2).collect::<Vec<_>>();
         let correct = (0..batch.len()).skip(1).step_by(2);
 
