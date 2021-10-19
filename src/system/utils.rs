@@ -1,19 +1,16 @@
-use super::*;
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use drop::crypto::key::exchange::PublicKey;
-use drop::crypto::Digest;
-
+use drop::crypto::{key::exchange::PublicKey, Digest};
 use futures::stream::{Stream, StreamExt};
-
-use murmur::Sequence;
-
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::{self, JoinHandle};
-
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::{self, JoinHandle},
+};
 use tracing::{error, trace, trace_span};
 use tracing_futures::Instrument;
+
+use super::*;
+use crate::Sequence;
 
 /// A convenient struct to manage conflicts between `Batch`es. <br />
 /// If any of the methods of this returns either `None` or `false` the associated
@@ -410,13 +407,11 @@ impl ConflictAgent {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
     use drop::test::keyset;
-
     use futures::StreamExt;
-
     use murmur::test::generate_batch;
+
+    use super::*;
 
     static SIZE: usize = 100;
 
