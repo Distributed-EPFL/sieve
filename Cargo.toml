@@ -7,9 +7,10 @@ readme = "README.md"
 description = "An implementation of probabilistic consistent broadcast"
 repository = "https://github.com/Distributed-EPFL/sieve"
 license = "AGPL-3.0-or-later"
+resolver = "2"
 
 [dependencies]
-drop = { git = "https://github.com/Distributed-EPFL/drop", features = [ "system" ] }
+drop = { git = "https://github.com/Distributed-EPFL/drop" }
 murmur = { git = "https://github.com/Distributed-EPFL/murmur" }
 serde = { version = "1.0" }
 futures = "0.3"
@@ -30,5 +31,5 @@ tokio = { version = "1.0", features = [ "macros" ] }
 [features]
 default = []
 cli = [ "structopt", "murmur/cli" ]
+system = ["drop/system", "murmur/system"]
 test = [ "drop/test", "murmur/test" ]
-
