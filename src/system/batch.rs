@@ -1,8 +1,6 @@
-use super::*;
+use std::{collections::BTreeSet, fmt, iter};
 
-use std::collections::BTreeSet;
-use std::fmt;
-use std::iter;
+use super::*;
 
 /// A view of a `Batch` that  filters out `Payload`s that haven't received sufficient echoes
 /// from other peers
@@ -43,7 +41,7 @@ where
     /// Create new `FilteredBatch` from a list of included sequences
     pub fn with_inclusion(batch: Arc<Batch<M>>, include: &BTreeSet<Sequence>) -> Self {
         let excluded = (0..batch.info().sequence())
-            .filter(|x| !include.contains(&x))
+            .filter(|x| !include.contains(x))
             .collect();
 
         Self { batch, excluded }
@@ -56,7 +54,7 @@ where
 
     /// Get the `Digest` from this `FilteredBatch`
     pub fn digest(&self) -> &Digest {
-        &self.batch.info().digest()
+        self.batch.info().digest()
     }
 
     /// Check if it is worth delivering this `FilteredBatch`
@@ -81,7 +79,7 @@ where
 
     /// Get the list of excluded `Sequence`s in this `FilteredBatch`
     pub fn included(&self) -> impl Iterator<Item = Sequence> + '_ {
-        (0..self.batch.info().sequence()).filter(move |x| !self.excluded.contains(&x))
+        (0..self.batch.info().sequence()).filter(move |x| !self.excluded.contains(x))
     }
 
     /// Number of excluded payloads in this `FilteredBatch`
@@ -130,7 +128,7 @@ where
 
         Self::new(
             self.batch.clone(),
-            (0..self.batch.info().sequence()).filter(|x| !included.contains(&x)),
+            (0..self.batch.info().sequence()).filter(|x| !included.contains(x)),
         )
     }
 
@@ -183,8 +181,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use murmur::test::generate_batch;
+
+    use super::*;
 
     const SIZE: usize = 10;
     const PAYLOAD_COUNT: usize = SIZE * SIZE;

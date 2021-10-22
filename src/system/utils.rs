@@ -511,11 +511,11 @@ mod test {
         let handle = EchoHandle::default();
         let batch = generate_batch(SIZE, SIZE);
         let digest = *batch.info().digest();
-        let keys: Vec<_> = keyset(SIZE).collect();
+        let keys = keyset(SIZE);
 
         let sequences = 0..batch.info().sequence();
 
-        for (idx, key) in keys.into_iter().enumerate() {
+        for (idx, key) in keys.enumerate() {
             handle
                 .send_many(digest, key, sequences.clone())
                 .await

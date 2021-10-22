@@ -1,6 +1,8 @@
-use std::ops::Deref;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    ops::Deref,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use super::{Batch, Message};
 
@@ -28,7 +30,7 @@ where
     type Target = Batch<M>;
 
     fn deref(&self) -> &Self::Target {
-        &self.batch.deref()
+        self.batch.deref()
     }
 }
 
